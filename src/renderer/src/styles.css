@@ -12,6 +12,8 @@
   --text-faint: #8793a3;
   --border: #d8dee6;
   --border-strong: #c1cbd7;
+  --section-border: #b5c1cf;
+  --section-inset: #e8edf3;
   --focus: #2563d8;
   --focus-soft: #dbeafe;
   --accent: #1d5fd0;
@@ -38,6 +40,8 @@
   --text-faint: #7d8998;
   --border: #353e4b;
   --border-strong: #495668;
+  --section-border: #59677a;
+  --section-inset: #293441;
   --focus: #74a7ff;
   --focus-soft: #213a60;
   --accent: #79aaff;
@@ -92,7 +96,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   gap: 16px;
   padding: 0 16px;
   background: var(--surface);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--section-border);
 }
 
 .brand { display: inline-flex; align-items: center; gap: 9px; font-weight: 650; color: var(--text); }
@@ -141,27 +145,49 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   align-items: center;
   min-width: 0;
   gap: 8px;
-  padding: 7px 16px;
+  padding: 6px 16px;
   background: var(--surface-muted);
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--section-border);
+  box-shadow: inset 0 1px 0 var(--section-inset);
   color: var(--text-muted);
 }
 
-.filter-bar > input {
-  min-width: 180px;
+.filter-search {
+  display: flex;
+  min-width: 200px;
   flex: 1 1 360px;
-  height: 32px;
-  padding: 0 6px;
+  height: 34px;
+  align-items: center;
+  gap: 7px;
+  padding: 0 9px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+  box-shadow: inset 0 1px 0 var(--section-inset);
+}
+
+.filter-search:focus-within {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 2px var(--focus-soft);
+}
+
+.filter-search > input {
+  min-width: 0;
+  width: 100%;
+  height: 100%;
+  padding: 0;
   border: 0;
+  outline: 0;
   background: transparent;
   color: var(--text);
 }
 
-.filter-bar input::placeholder { color: var(--text-faint); }
+.filter-search input::placeholder { color: var(--text-faint); }
 
 .filter-bar select, .date-filter input {
-  height: 30px;
-  border: 1px solid var(--border);
+  height: 32px;
+  border: 1px solid var(--border-strong);
   border-radius: 4px;
   background: var(--surface);
   color: var(--text);
@@ -207,7 +233,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .compact { min-height: 30px; padding: 0 9px; font-size: 12px; }
 
-.log-section { display: flex; min-height: 0; flex-direction: column; background: var(--surface); border-bottom: 1px solid var(--border); }
+.log-section { display: flex; min-height: 0; flex-direction: column; background: var(--surface); border-bottom: 1px solid var(--section-border); }
 
 .table-header, .log-row {
   display: grid;
@@ -219,15 +245,16 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 .table-header {
   min-height: 31px;
   padding: 0 8px;
-  border-bottom: 1px solid var(--border);
+  border-bottom: 1px solid var(--border-strong);
   background: var(--surface-muted);
+  box-shadow: inset 0 -1px 0 var(--section-inset);
   color: var(--text-muted);
   font-size: 11px;
   font-weight: 650;
   text-transform: uppercase;
 }
 
-.log-table-scroll { position: relative; min-height: 0; overflow: auto; }
+.log-table-scroll { position: relative; min-height: 0; overflow: auto; background: var(--surface); }
 
 .virtual-table { position: relative; min-width: 870px; }
 
@@ -274,9 +301,9 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .bottom-panel { display: flex; min-height: 0; flex-direction: column; background: var(--surface); }
 
-.panel-resizer { position: relative; z-index: 1; flex: 0 0 7px; cursor: row-resize; touch-action: none; }
+.panel-resizer { position: relative; z-index: 1; flex: 0 0 8px; cursor: row-resize; touch-action: none; border-block: 1px solid var(--section-border); background: var(--surface-muted); }
 
-.panel-resizer::after { position: absolute; top: 3px; right: 0; left: 0; height: 1px; background: var(--border-strong); content: ''; }
+.panel-resizer::after { position: absolute; top: 2px; right: 0; left: 0; height: 2px; background: var(--border-strong); content: ''; }
 
 .panel-resizer:hover, .panel-resizer:active { background: var(--focus-soft); }
 
@@ -288,13 +315,13 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .bottom-panel > .detail-loading { min-height: 0; }
 
-.panel-title { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.panel-title { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border-strong); background: var(--surface-muted); box-shadow: inset 0 -1px 0 var(--section-inset); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
 
-.file-list { min-height: 0; flex: 1; overflow: auto; }
+.file-list { min-height: 0; flex: 1; overflow: auto; background: var(--surface); }
 
 .file-table-header, .file-row { display: grid; grid-template-columns: minmax(260px, 1fr) 100px 18px; align-items: center; gap: 8px; min-width: 420px; padding-inline: 12px; }
 
-.file-table-header { min-height: 28px; border-bottom: 1px solid var(--border); background: var(--surface-muted); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
+.file-table-header { min-height: 28px; border-bottom: 1px solid var(--border-strong); background: color-mix(in srgb, var(--surface-muted) 78%, var(--surface)); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
 
 .file-virtual-list { position: relative; min-width: 420px; }
 
@@ -482,6 +509,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   .app-toolbar { grid-template-columns: minmax(260px, 1fr) auto; }
   .toolbar-center { display: none; }
   .filter-bar { gap: 6px; padding-inline: 10px; }
+  .filter-search { min-width: 170px; }
   .date-filter label { font-size: 0; }
 }
 

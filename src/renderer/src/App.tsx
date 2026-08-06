@@ -36,7 +36,7 @@ import type {
 type Theme = 'light' | 'dark'
 type GettingStartedMode = 'startup' | 'help' | null
 
-const applicationVersion = '0.0.3'
+const applicationVersion = '0.0.4'
 const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
@@ -911,8 +911,10 @@ function App(): React.JSX.Element {
       </header>
 
       <section className="filter-bar" aria-label="提交筛选">
-        <Search size={17} aria-hidden="true" />
-        <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="筛选提交信息、路径、作者、Hash" aria-label="搜索提交" />
+        <div className="filter-search">
+          <Search size={17} aria-hidden="true" />
+          <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="筛选提交信息、路径、作者、Hash" aria-label="搜索提交" />
+        </div>
         <select value={filter.scope} onChange={(event) => setFilter({ ...filter, scope: event.target.value as SearchScope })} aria-label="筛选字段">
           {searchScopes.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}
         </select>

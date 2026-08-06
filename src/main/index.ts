@@ -219,18 +219,39 @@ async function openExternalDiff(request: ExternalDiffRequest): Promise<void> {
     throw new Error('请先在设置中配置外部对比工具。')
   }
   const tempDirectory = await mkdtemp(join(tmpdir(), 'git-history-viewer-'))
-  const extension = extname(request.file.path)
-  const safeName = basename(request.file.path) || `comparison${extension || '.txt'}`
-  const left = join(tempDirectory, `before-${safeName}`)
-  const right = join(tempDirectory, `after-${safeName}`)
-  await writeComparisonFiles(request, left, right)
+  try {
+    const extension = extname(request.file.path)
+    const safeName = basename(request.file.path) || `comparison${extension || '.txt'}`
+    const left = join(tempDirectory, `before-${safeName}`)
+    const right = join(tempDirectory, `after-${safeName}`)
+    await writeComparisonFiles(request, left, right)
 
-  const child = spawn(
-    settings.command,
-    parseArguments(settings.argumentsTemplate, { left, right, file: request.file.path }),
-    { detached: true, stdio: 'ignore', windowsHide: false }
-  )
-  child.unref()
+    await new Promise<void>((resolve, reject) => {
+      let started = false
+      let child
+      try {
+        child = spawn(
+          settings.command,
+          parseArguments(settings.argumentsTemplate, { left, right, file: request.file.path }),
+          { detached: true, stdio: 'ignore', windowsHide: false }
+        )
+      } catch (error) {
+        reject(error)
+        return
+      }
+      child.once('error', (error) => {
+        if (!started) reject(new Error(`无法启动外部对比工具：${error.message}`))
+      })
+      child.once('spawn', () => {
+        started = true
+        child.unref()
+        resolve()
+      })
+    })
+  } catch (error) {
+    await rm(tempDirectory, { recursive: true, force: true })
+    throw error
+  }
   setTimeout(() => void rm(tempDirectory, { recursive: true, force: true }), 60 * 60 * 1000)
 }
 

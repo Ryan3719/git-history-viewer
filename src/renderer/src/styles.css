@@ -480,8 +480,6 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
 
-.preset-row { display: flex; gap: 4px; margin-top: -8px; }
-
 .busy-overlay { position: fixed; z-index: 120; left: 50%; bottom: 22px; display: inline-flex; align-items: center; gap: 9px; padding: 10px 14px; border: 1px solid var(--border-strong); border-radius: 5px; background: var(--surface); box-shadow: var(--shadow); transform: translateX(-50%); }
 
 @media (max-width: 1180px) {

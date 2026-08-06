@@ -87,6 +87,14 @@ function repoDirectoryName(url: string): string {
   return candidate?.replace(/[^a-zA-Z0-9._-]/g, '-') || 'repository'
 }
 
+function externalDiffArgumentsTemplate(command: string): string {
+  const executable = command.trim().split(/[\\/]/).at(-1)?.toLocaleLowerCase()
+  if (executable === 'code' || executable === 'code.exe' || executable === 'code-insiders' || executable === 'code-insiders.exe') {
+    return '--diff "{left}" "{right}"'
+  }
+  return '"{left}" "{right}"'
+}
+
 function changeStatusLabel(status: FileChange['status']): string {
   const labels: Record<FileChange['status'], string> = {
     A: '新增',
@@ -573,7 +581,12 @@ function App(): React.JSX.Element {
 
   const chooseExternalDiffTool = async (): Promise<void> => {
     const command = await window.gitHistory.chooseExternalDiffTool()
-    if (command) setExternalSettings((current) => ({ ...current, command }))
+    if (command) {
+      setExternalSettings({
+        command,
+        argumentsTemplate: externalDiffArgumentsTemplate(command)
+      })
+    }
   }
 
   const importRemoteRepository = async (): Promise<void> => {
@@ -653,10 +666,8 @@ function App(): React.JSX.Element {
   const settingsDialog = settingsOpen ? (
     <div className="modal-backdrop" role="presentation">
       <section className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-        <div className="modal-heading"><div><h2 id="settings-title">外部对比工具</h2><p>使用 <code>{'{left}'}</code>、<code>{'{right}'}</code> 和 <code>{'{file}'}</code> 作为参数占位符。</p></div><button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div>
-        <label>程序路径<div className="path-picker"><input value={externalSettings.command} onChange={(event) => setExternalSettings({ ...externalSettings, command: event.target.value })} placeholder="C:\\Program Files\\WinMerge\\WinMergeU.exe" autoFocus /><button className="secondary-button compact" type="button" onClick={() => void chooseExternalDiffTool()}>浏览</button></div></label>
-        <label>参数模板<input value={externalSettings.argumentsTemplate} onChange={(event) => setExternalSettings({ ...externalSettings, argumentsTemplate: event.target.value })} placeholder={'"{left}" "{right}"'} /></label>
-        <div className="preset-row"><button className="quiet-button" type="button" onClick={() => setExternalSettings({ command: 'WinMergeU.exe', argumentsTemplate: '"{left}" "{right}"' })}>WinMerge</button><button className="quiet-button" type="button" onClick={() => setExternalSettings({ command: 'code', argumentsTemplate: '--diff "{left}" "{right}"' })}>VS Code</button></div>
+        <div className="modal-heading"><div><h2 id="settings-title">外部对比工具</h2></div><button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div>
+        <label>程序路径<div className="path-picker"><input value={externalSettings.command} onChange={(event) => { const command = event.target.value; setExternalSettings({ command, argumentsTemplate: externalDiffArgumentsTemplate(command) }) }} placeholder="C:\\Program Files\\WinMerge\\WinMergeU.exe" autoFocus /><button className="secondary-button compact" type="button" onClick={() => void chooseExternalDiffTool()}>浏览</button></div></label>
         {settingsNotice && <div className="inline-error" role="alert">{settingsNotice}</div>}
         <div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setSettingsOpen(false)}>取消</button><button className="primary-button" type="button" onClick={() => void saveSettings()}><Check size={17} />保存</button></div>
       </section>

@@ -1,0 +1,92 @@
+export type SearchScope = 'all' | 'message' | 'author' | 'path' | 'hash'
+
+export interface HistoryFilter {
+  query: string
+  scope: SearchScope
+  from: string
+  to: string
+  limit: number
+}
+
+export interface RepositoryInfo {
+  path: string
+  name: string
+  branch: string
+  head: string
+}
+
+export interface RecentRepository extends RepositoryInfo {
+  lastOpenedAt: string
+}
+
+export interface CommitSummary {
+  hash: string
+  shortHash: string
+  parents: string[]
+  authorName: string
+  authorEmail: string
+  date: string
+  subject: string
+  refs: string[]
+}
+
+export interface HistoryPage {
+  commits: CommitSummary[]
+  hasMore: boolean
+  nextOffset: number
+}
+
+export type ChangeStatus = 'A' | 'M' | 'D' | 'R' | 'C' | 'T' | 'U' | 'X'
+
+export interface FileChange {
+  status: ChangeStatus
+  path: string
+  previousPath?: string
+}
+
+export interface CommitDetails {
+  hash: string
+  parents: string[]
+  fileChangesTotal: number
+}
+
+export interface FileChangesPage {
+  page: number
+  pageSize: number
+  total: number
+  changes: FileChange[]
+}
+
+export interface ExternalDiffSettings {
+  command: string
+  argumentsTemplate: string
+}
+
+export interface ExternalDiffRequest {
+  repositoryPath: string
+  commitHash: string
+  parentHash?: string
+  file: FileChange
+  settings: ExternalDiffSettings
+}
+
+export interface GitHistoryApi {
+  pickLocalRepository: () => Promise<RepositoryInfo | null>
+  openRecentRepository: (repositoryPath: string) => Promise<RepositoryInfo>
+  chooseCloneParent: () => Promise<string | null>
+  cloneRemoteRepository: (url: string, destination: string) => Promise<RepositoryInfo>
+  listRecentRepositories: () => Promise<RecentRepository[]>
+  addRecentRepository: (repository: RepositoryInfo) => Promise<RecentRepository[]>
+  removeRecentRepository: (repositoryPath: string) => Promise<RecentRepository[]>
+  clearRecentRepositories: () => Promise<void>
+  loadHistory: (repositoryPath: string, filter: HistoryFilter, offset?: number) => Promise<HistoryPage>
+  cancelHistoryRequests: () => Promise<void>
+  getCommitDetails: (repositoryPath: string, hash: string) => Promise<CommitDetails>
+  getFileChangesPage: (repositoryPath: string, hash: string, page: number) => Promise<FileChangesPage>
+  exportChangedPaths: (repositoryPath: string, hash: string) => Promise<boolean>
+  getExternalDiffSettings: () => Promise<ExternalDiffSettings>
+  chooseExternalDiffTool: () => Promise<string | null>
+  saveExternalDiffSettings: (settings: ExternalDiffSettings) => Promise<void>
+  openExternalDiff: (request: ExternalDiffRequest) => Promise<void>
+  openGitForWindowsDownload: () => Promise<void>
+}

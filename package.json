@@ -1,0 +1,87 @@
+{
+  "name": "git-history-viewer",
+  "version": "0.0.1",
+  "description": "A read-only Git history viewer and side-by-side comparison tool.",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "typecheck": "tsc --noEmit",
+    "dist:win": "npm run build && electron-builder --win nsis --publish never",
+    "dist:portable": "npm run build && electron-builder --win portable --publish never",
+    "dist:unpacked": "npm run build && electron-builder --win dir --publish never",
+    "dist:zip": "npm run build && electron-builder --win zip --publish never"
+  },
+  "keywords": [
+    "git",
+    "history",
+    "diff",
+    "electron"
+  ],
+  "license": "MIT",
+  "build": {
+    "appId": "com.usm.githistoryviewer",
+    "productName": "Git History Viewer",
+    "directories": {
+      "output": "release"
+    },
+    "icon": "resources/icon.ico",
+    "extraResources": [
+      {
+        "from": "resources/icon.ico",
+        "to": "icon.ico"
+      }
+    ],
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "icon": "resources/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-${version}-Portable.${ext}"
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-Setup.${ext}",
+      "installerIcon": "resources/icon.ico",
+      "uninstallerIcon": "resources/icon.ico",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "allowElevation": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "Git History Viewer",
+      "deleteAppDataOnUninstall": false
+    },
+    "portable": {
+      "unpackDirName": false
+    }
+  },
+  "dependencies": {
+    "@tanstack/react-virtual": "^3.14.9",
+    "lucide-react": "^1.28.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.0",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^5.0.0",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.15.3",
+    "electron-vite": "^5.0.0",
+    "typescript": "^7.0.2",
+    "vite": "^7.0.0"
+  }
+}

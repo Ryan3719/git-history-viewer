@@ -72,7 +72,7 @@ function createWindow(): void {
     height: 940,
     minWidth: 1100,
     minHeight: 720,
-    show: false,
+    show: true,
     title: 'Git History Viewer',
     icon: windowIconPath(),
     backgroundColor: '#eef1f4',
@@ -86,10 +86,6 @@ function createWindow(): void {
   })
 
   const webContentsId = mainWindow.webContents.id
-  mainWindow.once('ready-to-show', () => {
-    const windowToShow = mainWindow
-    if (windowToShow && !windowToShow.isDestroyed()) windowToShow.show()
-  })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url)
     return { action: 'deny' }

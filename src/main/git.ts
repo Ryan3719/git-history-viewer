@@ -1,7 +1,7 @@
 import { spawn } from 'node:child_process'
+import { createHash, randomUUID } from 'node:crypto'
 import { createWriteStream } from 'node:fs'
-import { access, mkdir, mkdtemp, open, rm, writeFile } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { access, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { dirname, join } from 'node:path'
 import type {
   ChangeStatus,
@@ -10,6 +10,7 @@ import type {
   ExternalDiffRequest,
   FileChange,
   FileChangesPage,
+  FileChangesStatus,
   HistoryFilter,
   HistoryPage,
   RepositoryInfo
@@ -19,7 +20,12 @@ const FIELD_SEPARATOR = '\u001f'
 const RECORD_SEPARATOR = '\u001e'
 const MAX_OUTPUT_BYTES = 32 * 1024 * 1024
 const FILE_CHANGES_PAGE_SIZE = 200
+const INITIAL_FILE_CHANGES_AVAILABLE = 50
 const MAX_FILE_CHANGES_CACHES = 4
+const MAX_RENAME_CANDIDATES = 2_000
+const FILE_CHANGES_CACHE_VERSION = 2
+const MAX_PERSISTENT_FILE_CHANGES_CACHE_BYTES = 512 * 1024 * 1024
+const MAX_PERSISTENT_FILE_CHANGES_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000
 
 interface GitRunOptions {
   maxOutputBytes?: number
@@ -28,16 +34,34 @@ interface GitRunOptions {
 
 interface FileChangesCache {
   key: string
-  directory: string
+  storageKey: string
+  repositoryPath: string
+  hash: string
   filePath: string
+  finalFilePath: string
+  metadataFilePath: string
   pageOffsets: number[]
   total: number
+  availableCount: number
+  complete: boolean
+  error: Error | null
+  progressWaiters: Set<() => void>
   lastUsed: number
-  ready: Promise<void>
+  initialized: Promise<void>
+  completion: Promise<void>
 }
 
 const fileChangesCaches = new Map<string, FileChangesCache>()
 let fileChangesCacheUsage = 0
+let fileChangesCacheDirectory = ''
+
+interface PersistedFileChangesCache {
+  version: number
+  repositoryPath: string
+  hash: string
+  pageOffsets: number[]
+  total: number
+}
 
 function abortError(): Error {
   const error = new Error('Git 读取已取消。')
@@ -232,8 +256,28 @@ function fileChangesCacheKey(repositoryPath: string, hash: string): string {
   return `${repositoryPath}\u0000${hash}`
 }
 
+function fileChangesStorageKey(repositoryPath: string, hash: string): string {
+  return createHash('sha256').update(fileChangesCacheKey(repositoryPath, hash)).digest('hex')
+}
+
+function currentFileChangesCacheDirectory(): string {
+  return fileChangesCacheDirectory || join(process.env.TEMP || process.env.TMP || '.', 'git-history-viewer-file-changes')
+}
+
+export function configureFileChangesCacheDirectory(directory: string): void {
+  fileChangesCacheDirectory = directory
+  void cleanPersistentFileChangesCaches()
+}
+
 function touchFileChangesCache(cache: FileChangesCache): void {
   cache.lastUsed = ++fileChangesCacheUsage
+  if (cache.complete && cache.filePath === cache.finalFilePath) {
+    const now = new Date()
+    void Promise.all([
+      utimes(cache.filePath, now, now),
+      utimes(cache.metadataFilePath, now, now)
+    ]).catch(() => undefined)
+  }
 }
 
 function evictFileChangesCaches(currentKey: string): void {
@@ -245,8 +289,136 @@ function evictFileChangesCaches(currentKey: string): void {
     const stale = candidates.shift()
     if (!stale) break
     fileChangesCaches.delete(stale.key)
-    void rm(stale.directory, { recursive: true, force: true })
   }
+}
+
+function notifyFileChangesProgress(cache: FileChangesCache): void {
+  const waiters = [...cache.progressWaiters]
+  cache.progressWaiters.clear()
+  waiters.forEach((resolve) => resolve())
+}
+
+function fileChangesStatus(cache: FileChangesCache): FileChangesStatus {
+  return {
+    scannedCount: cache.total,
+    availableCount: cache.availableCount,
+    complete: cache.complete
+  }
+}
+
+function isValidPersistedCache(value: unknown, fileSize: number, repositoryPath: string, hash: string): value is PersistedFileChangesCache {
+  if (!value || typeof value !== 'object') return false
+  const cache = value as Partial<PersistedFileChangesCache>
+  const total = cache.total
+  const pageOffsets = cache.pageOffsets
+  if (
+    cache.version !== FILE_CHANGES_CACHE_VERSION ||
+    cache.repositoryPath !== repositoryPath ||
+    cache.hash !== hash ||
+    typeof total !== 'number' ||
+    !Number.isSafeInteger(total) ||
+    total < 0 ||
+    !Array.isArray(pageOffsets)
+  ) {
+    return false
+  }
+
+  const expectedOffsets = Math.floor(total / FILE_CHANGES_PAGE_SIZE) + 1
+  if (pageOffsets.length !== expectedOffsets || pageOffsets[0] !== 0) return false
+  return pageOffsets.every((offset, index) => (
+    Number.isSafeInteger(offset) &&
+    offset >= 0 &&
+    offset <= fileSize &&
+    (index === 0 || offset >= pageOffsets[index - 1])
+  ))
+}
+
+async function removePersistentFileChangesCache(storageKey: string): Promise<void> {
+  const directory = currentFileChangesCacheDirectory()
+  await Promise.all([
+    rm(join(directory, `${storageKey}.paths.ndjson`), { force: true }),
+    rm(join(directory, `${storageKey}.paths.json`), { force: true }),
+    rm(join(directory, `${storageKey}.paths.part`), { force: true })
+  ])
+}
+
+async function cleanPersistentFileChangesCaches(): Promise<void> {
+  const directory = currentFileChangesCacheDirectory()
+  try {
+    await mkdir(directory, { recursive: true })
+    const entries = await readdir(directory, { withFileTypes: true })
+    const now = Date.now()
+    const protectedPaths = new Set([...fileChangesCaches.values()].map((cache) => cache.filePath))
+    const candidates: Array<{ storageKey: string; filePath: string; size: number; lastUsedAt: number }> = []
+
+    for (const entry of entries) {
+      if (!entry.isFile() || !entry.name.endsWith('.paths.ndjson')) continue
+      const filePath = join(directory, entry.name)
+      const storageKey = entry.name.slice(0, -'.paths.ndjson'.length)
+      const info = await stat(filePath)
+      if (protectedPaths.has(filePath)) {
+        candidates.push({ storageKey, filePath, size: info.size, lastUsedAt: info.mtimeMs })
+        continue
+      }
+      if (now - info.mtimeMs > MAX_PERSISTENT_FILE_CHANGES_CACHE_AGE_MS) {
+        await removePersistentFileChangesCache(storageKey)
+        continue
+      }
+      candidates.push({ storageKey, filePath, size: info.size, lastUsedAt: info.mtimeMs })
+    }
+
+    let totalSize = candidates.reduce((total, item) => total + item.size, 0)
+    for (const candidate of candidates.sort((left, right) => left.lastUsedAt - right.lastUsedAt)) {
+      if (totalSize <= MAX_PERSISTENT_FILE_CHANGES_CACHE_BYTES || protectedPaths.has(candidate.filePath)) continue
+      await removePersistentFileChangesCache(candidate.storageKey)
+      totalSize -= candidate.size
+    }
+  } catch {
+    // Cache maintenance must never affect repository browsing.
+  }
+}
+
+async function loadPersistentFileChangesCache(cache: FileChangesCache): Promise<boolean> {
+  try {
+    const [rawMetadata, fileInfo] = await Promise.all([
+      readFile(cache.metadataFilePath, 'utf8'),
+      stat(cache.finalFilePath)
+    ])
+    const metadata = JSON.parse(rawMetadata) as unknown
+    if (!isValidPersistedCache(metadata, fileInfo.size, cache.repositoryPath, cache.hash)) {
+      throw new Error('变更路径缓存无效')
+    }
+
+    cache.filePath = cache.finalFilePath
+    cache.pageOffsets = metadata.pageOffsets
+    cache.total = metadata.total
+    cache.availableCount = metadata.total
+    cache.complete = true
+    cache.completion = Promise.resolve()
+    touchFileChangesCache(cache)
+    return true
+  } catch {
+    await removePersistentFileChangesCache(cache.storageKey)
+    return false
+  }
+}
+
+async function persistFileChangesCache(cache: FileChangesCache): Promise<void> {
+  await rm(cache.finalFilePath, { force: true })
+  await rename(cache.filePath, cache.finalFilePath)
+  cache.filePath = cache.finalFilePath
+
+  const metadata: PersistedFileChangesCache = {
+    version: FILE_CHANGES_CACHE_VERSION,
+    repositoryPath: cache.repositoryPath,
+    hash: cache.hash,
+    pageOffsets: cache.pageOffsets,
+    total: cache.total
+  }
+  const temporaryMetadataPath = `${cache.metadataFilePath}.${randomUUID()}.tmp`
+  await writeFile(temporaryMetadataPath, JSON.stringify(metadata), 'utf8')
+  await rm(cache.metadataFilePath, { force: true })
+  await rename(temporaryMetadataPath, cache.metadataFilePath)
 }
 
 function populateFileChangesCache(
@@ -265,6 +437,7 @@ function populateFileChangesCache(
       '--name-status',
       '-r',
       '-M',
+      `-l${MAX_RENAME_CANDIDATES}`,
       '-z',
       hash
     ], {
@@ -273,7 +446,9 @@ function populateFileChangesCache(
       env: {
         ...process.env,
         GIT_OPTIONAL_LOCKS: '0',
-        GIT_PAGER: 'cat'
+        GIT_PAGER: 'cat',
+        LC_ALL: 'C',
+        LANG: 'C'
       }
     })
     const output = createWriteStream(cache.filePath)
@@ -306,8 +481,21 @@ function populateFileChangesCache(
       const line = Buffer.from(`${JSON.stringify(change)}\n`, 'utf8')
       byteOffset += line.length
       cache.total += 1
-      if (cache.total % FILE_CHANGES_PAGE_SIZE === 0) cache.pageOffsets.push(byteOffset)
-      if (!output.write(line) && !waitingForDrain) {
+      const completedPage = cache.total % FILE_CHANGES_PAGE_SIZE === 0
+      const shouldPublish = completedPage || cache.total === INITIAL_FILE_CHANGES_AVAILABLE
+      const publishedCount = cache.total
+      if (completedPage) cache.pageOffsets.push(byteOffset)
+      const markPageReady = (error?: Error | null): void => {
+        if (error) {
+          fail(new Error(`无法写入变更路径缓存：${error.message}`))
+          return
+        }
+        if (!shouldPublish) return
+        cache.availableCount = Math.max(cache.availableCount, publishedCount)
+        notifyFileChangesProgress(cache)
+      }
+      const written = shouldPublish ? output.write(line, markPageReady) : output.write(line)
+      if (!written && !waitingForDrain) {
         waitingForDrain = true
         child.stdout.pause()
         output.once('drain', () => {
@@ -375,6 +563,38 @@ function populateFileChangesCache(
   })
 }
 
+async function initializeFileChangesCache(
+  cache: FileChangesCache,
+  signal?: AbortSignal
+): Promise<void> {
+  if (signal?.aborted) throw abortError()
+  await mkdir(currentFileChangesCacheDirectory(), { recursive: true })
+  if (await loadPersistentFileChangesCache(cache)) return
+
+  cache.filePath = `${cache.finalFilePath}.${randomUUID()}.part`
+  cache.completion = populateFileChangesCache(cache, cache.repositoryPath, cache.hash, signal)
+    .then(async () => {
+      await persistFileChangesCache(cache)
+      cache.availableCount = cache.total
+      cache.complete = true
+      notifyFileChangesProgress(cache)
+      void cleanPersistentFileChangesCaches()
+    })
+    .catch(async (error: unknown) => {
+      const failure = error instanceof Error ? error : new Error('无法读取变更路径。')
+      cache.error = failure
+      notifyFileChangesProgress(cache)
+      fileChangesCaches.delete(cache.key)
+      await Promise.all([
+        rm(cache.filePath, { force: true }),
+        rm(cache.finalFilePath, { force: true }),
+        rm(cache.metadataFilePath, { force: true })
+      ])
+      throw failure
+    })
+  void cache.completion.catch(() => undefined)
+}
+
 async function getFileChangesCache(
   repositoryPath: string,
   hash: string,
@@ -383,32 +603,94 @@ async function getFileChangesCache(
   const key = fileChangesCacheKey(repositoryPath, hash)
   const existing = fileChangesCaches.get(key)
   if (existing) {
-    await existing.ready
+    await existing.initialized
     touchFileChangesCache(existing)
     return existing
   }
 
-  const directory = await mkdtemp(join(tmpdir(), 'git-history-viewer-paths-'))
+  const storageKey = fileChangesStorageKey(repositoryPath, hash)
+  const directory = currentFileChangesCacheDirectory()
   const cache: FileChangesCache = {
     key,
-    directory,
-    filePath: join(directory, 'paths.ndjson'),
+    storageKey,
+    repositoryPath,
+    hash,
+    filePath: '',
+    finalFilePath: join(directory, `${storageKey}.paths.ndjson`),
+    metadataFilePath: join(directory, `${storageKey}.paths.json`),
     pageOffsets: [0],
     total: 0,
+    availableCount: 0,
+    complete: false,
+    error: null,
+    progressWaiters: new Set(),
     lastUsed: ++fileChangesCacheUsage,
-    ready: Promise.resolve()
+    initialized: Promise.resolve(),
+    completion: Promise.resolve()
   }
-  cache.ready = populateFileChangesCache(cache, repositoryPath, hash, signal).catch(async (error: unknown) => {
+  fileChangesCaches.set(key, cache)
+  cache.initialized = initializeFileChangesCache(cache, signal).catch((error: unknown) => {
     fileChangesCaches.delete(key)
-    await rm(directory, { recursive: true, force: true })
     throw error
   })
-  fileChangesCaches.set(key, cache)
 
-  await cache.ready
+  await cache.initialized
   touchFileChangesCache(cache)
-  evictFileChangesCaches(key)
+  if (cache.complete) evictFileChangesCaches(key)
   return cache
+}
+
+async function waitForFileChangesPage(cache: FileChangesCache, page: number): Promise<void> {
+  const startIndex = page * FILE_CHANGES_PAGE_SIZE
+  while (!cache.complete && startIndex >= cache.availableCount && !cache.error) {
+    await new Promise<void>((resolve) => cache.progressWaiters.add(resolve))
+  }
+  if (cache.error) throw cache.error
+}
+
+async function readFileChangesPage(cache: FileChangesCache, page: number): Promise<FileChange[]> {
+  const startIndex = page * FILE_CHANGES_PAGE_SIZE
+  if (startIndex >= cache.total) return []
+
+  const start = cache.pageOffsets[page]
+  if (start === undefined) return []
+  const handle = await open(cache.filePath, 'r')
+  try {
+    const end = cache.pageOffsets[page + 1] ?? (await handle.stat()).size
+    const length = end - start
+    const buffer = Buffer.allocUnsafe(length)
+    let position = 0
+    while (position < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, position, buffer.length - position, start + position)
+      if (bytesRead === 0) break
+      position += bytesRead
+    }
+    return buffer
+      .subarray(0, position)
+      .toString('utf8')
+      .split('\n')
+      .filter(Boolean)
+      .map((line) => JSON.parse(line) as FileChange)
+  } finally {
+    await handle.close()
+  }
+}
+
+export async function startFileChangesScan(
+  repositoryPath: string,
+  hash: string,
+  signal?: AbortSignal
+): Promise<FileChangesStatus> {
+  const cache = await getFileChangesCache(repositoryPath, hash, signal)
+  return fileChangesStatus(cache)
+}
+
+export async function getFileChangesStatus(repositoryPath: string, hash: string): Promise<FileChangesStatus> {
+  const cache = fileChangesCaches.get(fileChangesCacheKey(repositoryPath, hash))
+  if (!cache) throw abortError()
+  await cache.initialized
+  if (cache.error) throw cache.error
+  return fileChangesStatus(cache)
 }
 
 export async function getFileChangesPage(
@@ -419,33 +701,14 @@ export async function getFileChangesPage(
 ): Promise<FileChangesPage> {
   const cache = await getFileChangesCache(repositoryPath, hash, signal)
   const normalizedPage = Math.max(0, Math.floor(page))
-  const startIndex = normalizedPage * FILE_CHANGES_PAGE_SIZE
-  if (startIndex >= cache.total) {
-    return { page: normalizedPage, pageSize: FILE_CHANGES_PAGE_SIZE, total: cache.total, changes: [] }
-  }
-
-  const start = cache.pageOffsets[normalizedPage]
-  const handle = await open(cache.filePath, 'r')
-  try {
-    const end = cache.pageOffsets[normalizedPage + 1] ?? (await handle.stat()).size
-    const length = end - start
-    const buffer = Buffer.allocUnsafe(length)
-    let position = 0
-    while (position < buffer.length) {
-      const { bytesRead } = await handle.read(buffer, position, buffer.length - position, start + position)
-      if (bytesRead === 0) break
-      position += bytesRead
-    }
-    const changes = buffer
-      .subarray(0, position)
-      .toString('utf8')
-      .split('\n')
-      .filter(Boolean)
-      .map((line) => JSON.parse(line) as FileChange)
-    touchFileChangesCache(cache)
-    return { page: normalizedPage, pageSize: FILE_CHANGES_PAGE_SIZE, total: cache.total, changes }
-  } finally {
-    await handle.close()
+  await waitForFileChangesPage(cache, normalizedPage)
+  const changes = await readFileChangesPage(cache, normalizedPage)
+  touchFileChangesCache(cache)
+  return {
+    page: normalizedPage,
+    pageSize: FILE_CHANGES_PAGE_SIZE,
+    changes,
+    ...fileChangesStatus(cache)
   }
 }
 
@@ -454,16 +717,12 @@ export async function getCommitDetails(
   hash: string,
   signal?: AbortSignal
 ): Promise<CommitDetails> {
-  const [raw, cache] = await Promise.all([
-    runGit(repositoryPath, ['show', '-s', '--format=%H%x1f%P', hash], { signal }),
-    getFileChangesCache(repositoryPath, hash, signal)
-  ])
+  const raw = await runGit(repositoryPath, ['show', '-s', '--format=%H%x1f%P', hash], { signal })
   const [commitHash, parents] = raw.toString('utf8').trim().split(FIELD_SEPARATOR)
 
   return {
     hash: commitHash,
-    parents: parents ? parents.split(' ') : [],
-    fileChangesTotal: cache.total
+    parents: parents ? parents.split(' ') : []
   }
 }
 

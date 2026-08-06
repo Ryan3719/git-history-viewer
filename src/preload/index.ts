@@ -13,11 +13,14 @@ contextBridge.exposeInMainWorld('gitHistory', {
   loadHistory: (repositoryPath: string, filter: HistoryFilter, offset = 0) => ipcRenderer.invoke('history:load', repositoryPath, filter, offset),
   cancelHistoryRequests: () => ipcRenderer.invoke('history:cancel'),
   getCommitDetails: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:details', repositoryPath, hash),
+  startFileChangesScan: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:file-changes:start', repositoryPath, hash),
+  getFileChangesStatus: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:file-changes:status', repositoryPath, hash),
   getFileChangesPage: (repositoryPath: string, hash: string, page: number) => ipcRenderer.invoke('history:file-changes-page', repositoryPath, hash, page),
   exportChangedPaths: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:export-paths', repositoryPath, hash),
   getExternalDiffSettings: () => ipcRenderer.invoke('settings:external-diff:get'),
   chooseExternalDiffTool: () => ipcRenderer.invoke('settings:external-diff:choose'),
   saveExternalDiffSettings: (settings: ExternalDiffSettings) => ipcRenderer.invoke('settings:external-diff:save', settings),
   openExternalDiff: (request: ExternalDiffRequest) => ipcRenderer.invoke('external-diff:open', request),
-  openGitForWindowsDownload: () => ipcRenderer.invoke('help:open-git-for-windows')
+  openGitForWindowsDownload: () => ipcRenderer.invoke('help:open-git-for-windows'),
+  openUserDataDirectory: () => ipcRenderer.invoke('app:open-user-data')
 })

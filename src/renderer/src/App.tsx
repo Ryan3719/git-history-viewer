@@ -26,6 +26,7 @@ import type {
   CommitSummary,
   ExternalDiffSettings,
   FileChange,
+  FileChangesStatus,
   HistoryFilter,
   RecentRepository,
   RepositoryInfo,
@@ -35,7 +36,7 @@ import type {
 type Theme = 'light' | 'dark'
 type GettingStartedMode = 'startup' | 'help' | null
 
-const applicationVersion = '0.0.1'
+const applicationVersion = '0.0.3'
 const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
@@ -187,6 +188,7 @@ function HistoryTable({
 function FileList({
   pages,
   total,
+  loading,
   selectedFile,
   onSelect,
   onCompare,
@@ -194,6 +196,7 @@ function FileList({
 }: {
   pages: Map<number, FileChange[]>
   total: number
+  loading: boolean
   selectedFile: FileChange | null
   onSelect: (file: FileChange) => void
   onCompare: (file: FileChange) => void
@@ -217,25 +220,17 @@ function FileList({
   return (
     <div ref={scrollRef} className="file-list" role="list" aria-label="变更路径">
       {total === 0 ? (
-        <div className="empty-files">该提交没有文件变更。</div>
+        loading ? (
+          <div className="file-list-loading" role="status"><LoaderCircle className="spin" size={18} />正在读取变更文件...</div>
+        ) : (
+          <div className="empty-files">该提交没有文件变更。</div>
+        )
       ) : (
         <div className="file-virtual-list" style={{ height: virtualizer.getTotalSize() }}>
           {rows.map((row) => {
             const page = Math.floor(row.index / fileChangesPageSize)
             const file = pages.get(page)?.[row.index % fileChangesPageSize]
-            if (!file) {
-              return (
-                <div
-                  key={row.index}
-                  className="file-row file-row-placeholder"
-                  role="listitem"
-                  aria-busy="true"
-                  style={{ transform: `translateY(${row.start}px)` }}
-                >
-                  <span className="file-path">正在读取路径...</span>
-                </div>
-              )
-            }
+            if (!file) return null
             return (
               <button
                 key={`${file.status}-${file.path}-${file.previousPath ?? ''}`}
@@ -277,6 +272,7 @@ function App(): React.JSX.Element {
   const [commits, setCommits] = useState<CommitSummary[]>([])
   const [selectedHash, setSelectedHash] = useState<string | null>(null)
   const [details, setDetails] = useState<CommitDetails | null>(null)
+  const [fileChangesStatus, setFileChangesStatus] = useState<FileChangesStatus | null>(null)
   const [filePages, setFilePages] = useState<Map<number, FileChange[]>>(() => new Map())
   const [selectedFile, setSelectedFile] = useState<FileChange | null>(null)
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('theme') as Theme) || 'light')
@@ -400,11 +396,13 @@ function App(): React.JSX.Element {
     setFilePages(new Map())
     if (!repository || !selectedHash) {
       setDetails(null)
+      setFileChangesStatus(null)
       setSelectedFile(null)
       return
     }
     let cancelled = false
     setDetails(null)
+    setFileChangesStatus(null)
     setSelectedFile(null)
     setLoadingDetails(true)
     void window.gitHistory
@@ -412,6 +410,16 @@ function App(): React.JSX.Element {
       .then((next) => {
         if (cancelled) return
         setDetails(next)
+        void window.gitHistory
+          .startFileChangesScan(repository.path, next.hash)
+          .then((status) => {
+            if (!cancelled) setFileChangesStatus(status)
+          })
+          .catch((scanError) => {
+            if (!cancelled && !isAbortError(scanError)) {
+              setError(scanError instanceof Error ? scanError.message : '无法读取变更路径。')
+            }
+          })
       })
       .catch((detailsError) => {
         if (!cancelled && !isAbortError(detailsError)) {
@@ -426,6 +434,31 @@ function App(): React.JSX.Element {
     }
   }, [repository, selectedHash])
 
+  useEffect(() => {
+    if (!repository || !details || fileChangesStatus?.complete) return
+    let cancelled = false
+    let timer: number | undefined
+
+    const pollStatus = async (): Promise<void> => {
+      try {
+        const next = await window.gitHistory.getFileChangesStatus(repository.path, details.hash)
+        if (cancelled) return
+        setFileChangesStatus(next)
+        if (!next.complete) timer = window.setTimeout(() => void pollStatus(), 250)
+      } catch (statusError) {
+        if (!cancelled && !isAbortError(statusError)) {
+          setError(statusError instanceof Error ? statusError.message : '无法读取变更路径。')
+        }
+      }
+    }
+
+    void pollStatus()
+    return () => {
+      cancelled = true
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [details, fileChangesStatus?.complete, repository])
+
   const requestFileChangesPage = useCallback((page: number): void => {
     if (!repository || !details) return
     const generation = filePageGenerationRef.current
@@ -435,9 +468,14 @@ function App(): React.JSX.Element {
 
     void window.gitHistory
       .getFileChangesPage(repository.path, details.hash, page)
-      .then((result) => {
-        if (generation !== filePageGenerationRef.current) return
-        setFilePages((current) => {
+        .then((result) => {
+          if (generation !== filePageGenerationRef.current) return
+          setFileChangesStatus({
+            scannedCount: result.scannedCount,
+            availableCount: result.availableCount,
+            complete: result.complete
+          })
+          setFilePages((current) => {
           const next = new Map(current)
           next.delete(result.page)
           next.set(result.page, result.changes)
@@ -467,6 +505,7 @@ function App(): React.JSX.Element {
     setHistoryHasMore(false)
     setSelectedHash(null)
     setDetails(null)
+    setFileChangesStatus(null)
     setFilePages(new Map())
     setSelectedFile(null)
     setLoadingHistory(false)
@@ -486,6 +525,7 @@ function App(): React.JSX.Element {
     setHistoryHasMore(false)
     setSelectedHash(null)
     setDetails(null)
+    setFileChangesStatus(null)
     setFilePages(new Map())
     setSelectedFile(null)
     setLoadingHistory(false)
@@ -659,7 +699,19 @@ function App(): React.JSX.Element {
     }
   }
 
+  const openUserDataDirectory = async (): Promise<void> => {
+    try {
+      await window.gitHistory.openUserDataDirectory()
+    } catch (openDirectoryError) {
+      setError(openDirectoryError instanceof Error ? openDirectoryError.message : '无法打开应用数据目录。')
+    }
+  }
+
   const activeFilterCount = Number(Boolean(filter.query)) + Number(Boolean(filter.from)) + Number(Boolean(filter.to))
+  const visibleFileCount = fileChangesStatus
+    ? (fileChangesStatus.complete ? fileChangesStatus.scannedCount : fileChangesStatus.availableCount)
+    : 0
+  const fileChangesLoading = Boolean(details) && !fileChangesStatus?.complete
   const appShellStyle = pathsPanelHeight === null
     ? undefined
     : ({ '--paths-panel-height': `${pathsPanelHeight}px` } as React.CSSProperties)
@@ -745,6 +797,9 @@ function App(): React.JSX.Element {
             </div>
           </nav>
           <div className="welcome-corner-actions">
+            <button className="secondary-button compact" type="button" onClick={() => void openUserDataDirectory()}>
+              <FolderOpen size={15} />打开数据目录
+            </button>
             <button className="secondary-button compact" type="button" onClick={() => void openSettings()}>
               <Settings size={15} />外部对比工具
             </button>
@@ -894,16 +949,15 @@ function App(): React.JSX.Element {
           onKeyDown={resizePathsWithKeyboard}
         />
         {loadingDetails ? (
-          <div className="detail-loading"><LoaderCircle className="spin" size={20} />正在读取提交详情...</div>
+          <div className="detail-loading"><LoaderCircle className="spin" size={20} />正在读取记录信息...</div>
         ) : !details ? (
           <div className="detail-loading">选择一条提交以查看变更路径。</div>
         ) : (
           <aside className="paths-panel">
             <div className="panel-title">
               <span>Changed Paths</span>
-              <span className="paths-summary"><small>{details.fileChangesTotal.toLocaleString()} 个文件</small></span>
             </div>
-            {details.fileChangesTotal > 0 && (
+            {visibleFileCount > 0 && (
               <div className="file-table-header" aria-hidden="true">
                 <span>Path</span>
                 <span>Action</span>
@@ -912,7 +966,8 @@ function App(): React.JSX.Element {
             )}
             <FileList
               pages={filePages}
-              total={details.fileChangesTotal}
+              total={visibleFileCount}
+              loading={fileChangesLoading}
               selectedFile={selectedFile}
               onSelect={setSelectedFile}
               onCompare={(file) => void openExternalComparison(file)}

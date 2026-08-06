@@ -1,6 +1,6 @@
 {
   "name": "git-history-viewer",
-  "version": "0.0.1",
+  "version": "0.0.3",
   "description": "A read-only Git history viewer and side-by-side comparison tool.",
   "main": "./out/main/index.js",
   "scripts": {
@@ -37,6 +37,7 @@
       "out/**/*",
       "package.json"
     ],
+    "electronDist": "node_modules/electron/dist",
     "asar": true,
     "compression": "maximum",
     "win": {

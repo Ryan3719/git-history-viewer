@@ -47,13 +47,17 @@ export interface FileChange {
 export interface CommitDetails {
   hash: string
   parents: string[]
-  fileChangesTotal: number
 }
 
-export interface FileChangesPage {
+export interface FileChangesStatus {
+  scannedCount: number
+  availableCount: number
+  complete: boolean
+}
+
+export interface FileChangesPage extends FileChangesStatus {
   page: number
   pageSize: number
-  total: number
   changes: FileChange[]
 }
 
@@ -82,6 +86,8 @@ export interface GitHistoryApi {
   loadHistory: (repositoryPath: string, filter: HistoryFilter, offset?: number) => Promise<HistoryPage>
   cancelHistoryRequests: () => Promise<void>
   getCommitDetails: (repositoryPath: string, hash: string) => Promise<CommitDetails>
+  startFileChangesScan: (repositoryPath: string, hash: string) => Promise<FileChangesStatus>
+  getFileChangesStatus: (repositoryPath: string, hash: string) => Promise<FileChangesStatus>
   getFileChangesPage: (repositoryPath: string, hash: string, page: number) => Promise<FileChangesPage>
   exportChangedPaths: (repositoryPath: string, hash: string) => Promise<boolean>
   getExternalDiffSettings: () => Promise<ExternalDiffSettings>
@@ -89,4 +95,5 @@ export interface GitHistoryApi {
   saveExternalDiffSettings: (settings: ExternalDiffSettings) => Promise<void>
   openExternalDiff: (request: ExternalDiffRequest) => Promise<void>
   openGitForWindowsDownload: () => Promise<void>
+  openUserDataDirectory: () => Promise<void>
 }

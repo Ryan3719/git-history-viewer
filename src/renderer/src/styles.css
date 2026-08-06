@@ -270,6 +270,8 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .empty-table, .detail-loading, .empty-files { display: grid; min-height: 100%; place-items: center; padding: 24px; color: var(--text-muted); text-align: center; }
 
+.file-list-loading { display: flex; min-height: 100%; align-items: center; justify-content: center; gap: 8px; padding: 24px; color: var(--text-muted); }
+
 .bottom-panel { display: flex; min-height: 0; flex-direction: column; background: var(--surface); }
 
 .panel-resizer { position: relative; z-index: 1; flex: 0 0 7px; cursor: row-resize; touch-action: none; }
@@ -286,11 +288,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .bottom-panel > .detail-loading { min-height: 0; }
 
-.panel-title { display: flex; min-height: 34px; align-items: center; justify-content: space-between; padding: 0 12px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
-
-.panel-title small { color: var(--text-faint); font-weight: 600; }
-
-.paths-summary { display: inline-flex; align-items: center; gap: 8px; }
+.panel-title { display: flex; min-height: 34px; align-items: center; justify-content: space-between; gap: 8px; padding: 0 12px; border-bottom: 1px solid var(--border); color: var(--text-muted); font-size: 11px; font-weight: 700; text-transform: uppercase; }
 
 .file-list { min-height: 0; flex: 1; overflow: auto; }
 
@@ -305,8 +303,6 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 .file-row:hover { background: var(--surface-hover); }
 
 .file-row.is-active { background: var(--focus-soft); box-shadow: inset 3px 0 0 var(--focus); }
-
-.file-row-placeholder { color: var(--text-faint); pointer-events: none; }
 
 .change-badge { display: grid; width: 20px; height: 20px; place-items: center; border-radius: 3px; background: var(--surface-muted); color: var(--text-muted); font-size: 11px; font-weight: 800; }
 

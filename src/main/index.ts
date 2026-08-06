@@ -6,10 +6,13 @@ import { spawn } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import {
   cloneRemoteRepository,
+  configureFileChangesCacheDirectory,
   getCommitDetails,
   getFileChangesPage,
+  getFileChangesStatus,
   getRepositoryInfo,
   listCommits,
+  startFileChangesScan,
   writeComparisonFiles
 } from './git'
 import type {
@@ -23,6 +26,7 @@ import type {
 let mainWindow: BrowserWindow | undefined
 const historyLoadRequests = new Map<number, AbortController>()
 const historyDetailRequests = new Map<number, AbortController>()
+const fileChangesRequests = new Map<number, AbortController>()
 const defaultExternalDiffSettings: ExternalDiffSettings = {
   command: '',
   argumentsTemplate: '"{left}" "{right}"'
@@ -56,8 +60,10 @@ async function runLatestRequest<T>(
 function abortRequestsForWebContents(senderId: number): void {
   historyLoadRequests.get(senderId)?.abort()
   historyDetailRequests.get(senderId)?.abort()
+  fileChangesRequests.get(senderId)?.abort()
   historyLoadRequests.delete(senderId)
   historyDetailRequests.delete(senderId)
+  fileChangesRequests.delete(senderId)
 }
 
 function windowIconPath(): string {
@@ -329,6 +335,7 @@ app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512')
 
 app.whenReady().then(() => {
+  configureFileChangesCacheDirectory(join(app.getPath('userData'), 'file-changes-cache'))
   Menu.setApplicationMenu(null)
   createWindow()
 
@@ -358,6 +365,21 @@ app.whenReady().then(() => {
   ipcMain.handle('history:details', (event, repositoryPath: string, hash: string) =>
     runLatestRequest(historyDetailRequests, event.sender.id, (signal) => getCommitDetails(repositoryPath, hash, signal))
   )
+  ipcMain.handle('history:file-changes:start', async (event, repositoryPath: string, hash: string) => {
+    const senderId = event.sender.id
+    fileChangesRequests.get(senderId)?.abort()
+    const controller = new AbortController()
+    fileChangesRequests.set(senderId, controller)
+    try {
+      return await startFileChangesScan(repositoryPath, hash, controller.signal)
+    } catch (error) {
+      if (fileChangesRequests.get(senderId) === controller) fileChangesRequests.delete(senderId)
+      throw error
+    }
+  })
+  ipcMain.handle('history:file-changes:status', (_, repositoryPath: string, hash: string) =>
+    getFileChangesStatus(repositoryPath, hash)
+  )
   ipcMain.handle('history:file-changes-page', (_, repositoryPath: string, hash: string, page: number) =>
     getFileChangesPage(repositoryPath, hash, page)
   )
@@ -378,6 +400,12 @@ app.whenReady().then(() => {
   ipcMain.handle('settings:external-diff:save', (_, settings: ExternalDiffSettings) => saveExternalDiffSettings(settings))
   ipcMain.handle('external-diff:open', (_, request: ExternalDiffRequest) => openExternalDiff(request))
   ipcMain.handle('help:open-git-for-windows', () => shell.openExternal(gitForWindowsInstallUrl))
+  ipcMain.handle('app:open-user-data', async () => {
+    const userDataDirectory = app.getPath('userData')
+    await mkdir(userDataDirectory, { recursive: true })
+    const result = await shell.openPath(userDataDirectory)
+    if (result) throw new Error(`无法打开应用数据目录：${result}`)
+  })
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()

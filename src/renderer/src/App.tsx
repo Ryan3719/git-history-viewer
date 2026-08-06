@@ -36,7 +36,7 @@ import type {
 type Theme = 'light' | 'dark'
 type GettingStartedMode = 'startup' | 'help' | null
 
-const applicationVersion = '0.0.4'
+const applicationVersion = '0.0.5'
 const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
@@ -263,6 +263,7 @@ function App(): React.JSX.Element {
   const pathsResizeRef = useRef<PathsResizeState | null>(null)
   const historyRequestRef = useRef(0)
   const historyOffsetRef = useRef(0)
+  const repositoryOpenRequestRef = useRef(0)
   const commitsRef = useRef<CommitSummary[]>([])
   const filePageRequestsRef = useRef(new Set<string>())
   const filePageGenerationRef = useRef(0)
@@ -496,7 +497,7 @@ function App(): React.JSX.Element {
       .finally(() => filePageRequestsRef.current.delete(requestKey))
   }, [details, repository])
 
-  const selectRepository = (repo: RepositoryInfo): void => {
+  const selectRepository = useCallback((repo: RepositoryInfo): void => {
     historyRequestRef.current += 1
     historyOffsetRef.current = 0
     filePageGenerationRef.current += 1
@@ -514,7 +515,7 @@ function App(): React.JSX.Element {
     void window.gitHistory.addRecentRepository(repo).then(setRecentRepositories).catch((saveError) => {
       setError(saveError instanceof Error ? saveError.message : '无法保存最近打开的项目。')
     })
-  }
+  }, [])
 
   const closeRepository = (): void => {
     historyRequestRef.current += 1
@@ -583,14 +584,30 @@ function App(): React.JSX.Element {
     }
   }
 
-  const openRecentRepository = async (recent: RecentRepository): Promise<void> => {
+  const openRepositoryPath = useCallback(async (repositoryPath: string, failureMessage: string): Promise<void> => {
+    const requestId = ++repositoryOpenRequestRef.current
     setError('')
     try {
-      selectRepository(await window.gitHistory.openRecentRepository(recent.path))
+      const repo = await window.gitHistory.openRecentRepository(repositoryPath)
+      if (requestId === repositoryOpenRequestRef.current) selectRepository(repo)
     } catch (openError) {
-      setError(openError instanceof Error ? openError.message : '无法打开该项目。请确认仓库路径仍然可用。')
+      if (requestId === repositoryOpenRequestRef.current) {
+        setError(openError instanceof Error ? openError.message : failureMessage)
+      }
     }
+  }, [selectRepository])
+
+  const openRecentRepository = async (recent: RecentRepository): Promise<void> => {
+    await openRepositoryPath(recent.path, '无法打开该项目。请确认仓库路径仍然可用。')
   }
+
+  useEffect(() => {
+    const removeListener = window.gitHistory.onRepositoryRequested((repositoryPath) => {
+      void openRepositoryPath(repositoryPath, '所选目录不是可读取的 Git 仓库。')
+    })
+    void window.gitHistory.notifyRepositoryListenerReady()
+    return removeListener
+  }, [openRepositoryPath])
 
   const removeRecentRepository = async (repositoryPath: string): Promise<void> => {
     try {

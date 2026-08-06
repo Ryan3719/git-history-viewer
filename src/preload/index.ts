@@ -4,6 +4,12 @@ import type { ExternalDiffRequest, ExternalDiffSettings, HistoryFilter, Reposito
 contextBridge.exposeInMainWorld('gitHistory', {
   pickLocalRepository: () => ipcRenderer.invoke('repository:pick-local'),
   openRecentRepository: (repositoryPath: string) => ipcRenderer.invoke('repository:open-recent', repositoryPath),
+  onRepositoryRequested: (callback: (repositoryPath: string) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, repositoryPath: string): void => callback(repositoryPath)
+    ipcRenderer.on('repository:open-from-shell', listener)
+    return () => ipcRenderer.removeListener('repository:open-from-shell', listener)
+  },
+  notifyRepositoryListenerReady: () => ipcRenderer.invoke('app:repository-listener-ready'),
   chooseCloneParent: () => ipcRenderer.invoke('repository:choose-clone-parent'),
   cloneRemoteRepository: (url: string, destination: string) => ipcRenderer.invoke('repository:clone', url, destination),
   listRecentRepositories: () => ipcRenderer.invoke('recent-repositories:list'),

@@ -24,6 +24,8 @@ import type {
 } from '../shared/types'
 
 let mainWindow: BrowserWindow | undefined
+let rendererRepositoryListenerReady = false
+let pendingRepositoryPath = parseRepositoryPath(process.argv)
 const historyLoadRequests = new Map<number, AbortController>()
 const historyDetailRequests = new Map<number, AbortController>()
 const fileChangesRequests = new Map<number, AbortController>()
@@ -41,6 +43,42 @@ interface StoredSettings {
 }
 
 let settingsWriteQueue = Promise.resolve()
+
+function parseRepositoryPath(argv: string[]): string | null {
+  for (let index = 0; index < argv.length; index += 1) {
+    const argument = argv[index]
+    if (argument === '--repo') {
+      const repositoryPath = argv[index + 1]?.trim()
+      return repositoryPath || null
+    }
+    if (argument.startsWith('--repo=')) {
+      const repositoryPath = argument.slice('--repo='.length).trim()
+      return repositoryPath || null
+    }
+  }
+  return null
+}
+
+function focusMainWindow(): void {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+}
+
+function sendPendingRepositoryRequest(): void {
+  if (!pendingRepositoryPath || !rendererRepositoryListenerReady || !mainWindow || mainWindow.isDestroyed()) return
+  const repositoryPath = pendingRepositoryPath
+  pendingRepositoryPath = null
+  mainWindow.webContents.send('repository:open-from-shell', repositoryPath)
+}
+
+function requestRepositoryOpen(repositoryPath: string | null): void {
+  if (!repositoryPath) return
+  pendingRepositoryPath = repositoryPath
+  focusMainWindow()
+  sendPendingRepositoryRequest()
+}
 
 async function runLatestRequest<T>(
   requests: Map<number, AbortController>,
@@ -73,6 +111,7 @@ function windowIconPath(): string {
 }
 
 function createWindow(): void {
+  rendererRepositoryListenerReady = false
   mainWindow = new BrowserWindow({
     width: 1440,
     height: 940,
@@ -92,11 +131,17 @@ function createWindow(): void {
   })
 
   const webContentsId = mainWindow.webContents.id
+  mainWindow.webContents.on('did-start-loading', () => {
+    rendererRepositoryListenerReady = false
+  })
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     void shell.openExternal(url)
     return { action: 'deny' }
   })
-  mainWindow.webContents.once('destroyed', () => abortRequestsForWebContents(webContentsId))
+  mainWindow.webContents.once('destroyed', () => {
+    rendererRepositoryListenerReady = false
+    abortRequestsForWebContents(webContentsId)
+  })
 
   if (process.env.ELECTRON_RENDERER_URL) {
     void mainWindow.loadURL(process.env.ELECTRON_RENDERER_URL)
@@ -334,10 +379,27 @@ async function exportChangedPaths(repositoryPath: string, hash: string): Promise
 app.disableHardwareAcceleration()
 app.commandLine.appendSwitch('js-flags', '--max-old-space-size=512')
 
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) {
+  app.quit()
+} else {
+  app.on('second-instance', (_event, argv) => {
+    requestRepositoryOpen(parseRepositoryPath(argv))
+  })
+}
+
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return
   configureFileChangesCacheDirectory(join(app.getPath('userData'), 'file-changes-cache'))
   Menu.setApplicationMenu(null)
   createWindow()
+
+  ipcMain.handle('app:repository-listener-ready', (event) => {
+    if (event.sender !== mainWindow?.webContents) return
+    rendererRepositoryListenerReady = true
+    sendPendingRepositoryRequest()
+  })
 
   ipcMain.handle('repository:pick-local', async () => {
     const result = await dialog.showOpenDialog({

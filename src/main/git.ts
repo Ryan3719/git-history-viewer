@@ -150,7 +150,16 @@ async function tryGitText(cwd: string | undefined, args: string[]): Promise<stri
 }
 
 export async function getRepositoryInfo(repositoryPath: string): Promise<RepositoryInfo> {
-  const root = await runGitText(repositoryPath, ['rev-parse', '--show-toplevel'])
+  let root: string
+  try {
+    root = await runGitText(repositoryPath, ['rev-parse', '--show-toplevel'])
+  } catch (error) {
+    const message = error instanceof Error ? error.message : ''
+    if (/not a git repository|不是.*git.*仓库/i.test(message)) {
+      throw new Error('不是 Git 仓库。')
+    }
+    throw error
+  }
   const branch = (await tryGitText(root, ['branch', '--show-current'])) || 'DETACHED'
   const head = await tryGitText(root, ['rev-parse', '--short', 'HEAD'])
   const segments = root.replace(/[\\/]+$/, '').split(/[\\/]/)

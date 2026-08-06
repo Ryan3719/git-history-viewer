@@ -77,6 +77,8 @@ export interface ExternalDiffRequest {
 export interface GitHistoryApi {
   pickLocalRepository: () => Promise<RepositoryInfo | null>
   openRecentRepository: (repositoryPath: string) => Promise<RepositoryInfo>
+  onRepositoryRequested: (callback: (repositoryPath: string) => void) => () => void
+  notifyRepositoryListenerReady: () => Promise<void>
   chooseCloneParent: () => Promise<string | null>
   cloneRemoteRepository: (url: string, destination: string) => Promise<RepositoryInfo>
   listRecentRepositories: () => Promise<RecentRepository[]>

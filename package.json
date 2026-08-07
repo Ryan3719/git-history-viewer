@@ -74,6 +74,7 @@
     "@types/node": "^24.10.0",
     "@types/react": "^19.2.0",
     "@types/react-dom": "^19.2.0",
+    "@types/ssh2": "^1.15.5",
     "@vitejs/plugin-react": "^5.0.0",
     "electron": "^43.2.0",
     "electron-builder": "^26.15.3",
@@ -83,5 +84,8 @@
     "react-dom": "^19.2.8",
     "typescript": "^7.0.2",
     "vite": "^7.0.0"
+  },
+  "dependencies": {
+    "ssh2": "^1.17.0"
   }
 }

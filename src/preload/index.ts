@@ -1,5 +1,11 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { ExternalDiffRequest, ExternalDiffSettings, HistoryFilter, RepositoryInfo } from '../shared/types'
+import type {
+  ExternalDiffRequest,
+  ExternalDiffSettings,
+  HistoryFilter,
+  RepositoryInfo,
+  SshRepositoryMapping
+} from '../shared/types'
 
 contextBridge.exposeInMainWorld('gitHistory', {
   pickLocalRepository: () => ipcRenderer.invoke('repository:pick-local'),
@@ -10,6 +16,11 @@ contextBridge.exposeInMainWorld('gitHistory', {
     return () => ipcRenderer.removeListener('repository:open-from-shell', listener)
   },
   notifyRepositoryListenerReady: () => ipcRenderer.invoke('app:repository-listener-ready'),
+  listSshRepositoryMappings: () => ipcRenderer.invoke('ssh-mappings:list'),
+  saveSshRepositoryMappings: (mappings: SshRepositoryMapping[]) => ipcRenderer.invoke('ssh-mappings:save', mappings),
+  setSshRepositoryPassword: (mappingId: string, password: string, remember: boolean) => ipcRenderer.invoke('ssh-mappings:set-password', mappingId, password, remember),
+  testSshRepositoryMapping: (mapping: SshRepositoryMapping, password?: string) => ipcRenderer.invoke('ssh-mappings:test', mapping, password),
+  chooseSshIdentityFile: () => ipcRenderer.invoke('ssh-mappings:choose-identity-file'),
   chooseCloneParent: () => ipcRenderer.invoke('repository:choose-clone-parent'),
   cloneRemoteRepository: (url: string, destination: string) => ipcRenderer.invoke('repository:clone', url, destination),
   listRecentRepositories: () => ipcRenderer.invoke('recent-repositories:list'),

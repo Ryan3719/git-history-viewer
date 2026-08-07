@@ -1,18 +1,22 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, shell } from 'electron'
-import { createWriteStream } from 'node:fs'
+import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from 'electron'
 import { basename, extname, join } from 'node:path'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import {
   cloneRemoteRepository,
   configureFileChangesCacheDirectory,
+  configureSshRepositoryMappings,
+  exportChangedPaths as exportGitChangedPaths,
   getCommitDetails,
   getFileChangesPage,
   getFileChangesStatus,
   getRepositoryInfo,
   listCommits,
+  setSshRepositoryPassword,
   startFileChangesScan,
+  testSshRepositoryMapping,
   writeComparisonFiles
 } from './git'
 import type {
@@ -20,7 +24,8 @@ import type {
   ExternalDiffSettings,
   HistoryFilter,
   RecentRepository,
-  RepositoryInfo
+  RepositoryInfo,
+  SshRepositoryMapping
 } from '../shared/types'
 
 let mainWindow: BrowserWindow | undefined
@@ -40,6 +45,8 @@ interface StoredSettings {
   command?: string
   argumentsTemplate?: string
   recentRepositories?: RecentRepository[]
+  sshRepositoryMappings?: SshRepositoryMapping[]
+  sshRepositoryPasswords?: Record<string, string>
 }
 
 let settingsWriteQueue = Promise.resolve()
@@ -180,13 +187,66 @@ function normalizeRecentRepositories(value: unknown): RecentRepository[] {
     .slice(0, maximumRecentRepositories)
 }
 
+function normalizeSshRepositoryMappings(value: unknown): SshRepositoryMapping[] {
+  if (!Array.isArray(value)) return []
+  const mappings = new Map<string, SshRepositoryMapping>()
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue
+    const mapping = item as Partial<SshRepositoryMapping>
+    const localPath = typeof mapping.localPath === 'string' ? mapping.localPath.trim() : ''
+    const host = typeof mapping.host === 'string' ? mapping.host.trim() : ''
+    const username = typeof mapping.username === 'string' ? mapping.username.trim() : ''
+    const remotePath = typeof mapping.remotePath === 'string' ? mapping.remotePath.trim() : ''
+    const port = Math.floor(Number(mapping.port))
+    if (
+      !host ||
+      !username ||
+      (Boolean(localPath) !== Boolean(remotePath)) ||
+      (remotePath && !remotePath.startsWith('/')) ||
+      !Number.isInteger(port) ||
+      port < 1 ||
+      port > 65535
+    ) {
+      continue
+    }
+    const id = typeof mapping.id === 'string' && mapping.id.trim() ? mapping.id.trim().toLocaleLowerCase() : randomUUID()
+    mappings.set(id, {
+      id,
+      localPath,
+      host,
+      port,
+      username,
+      remotePath,
+      identityFile: typeof mapping.identityFile === 'string' ? mapping.identityFile.trim() : '',
+      authMethod: mapping.authMethod === 'password' || mapping.authMethod === 'privateKey' || mapping.authMethod === 'agent'
+        ? mapping.authMethod
+        : (typeof mapping.identityFile === 'string' && mapping.identityFile.trim() ? 'privateKey' : 'agent')
+    })
+  }
+  return [...mappings.values()]
+}
+
+function normalizeStoredSshPasswords(value: unknown): Record<string, string> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {}
+  const passwords: Record<string, string> = {}
+  for (const [mappingId, encryptedPassword] of Object.entries(value)) {
+    const normalizedMappingId = mappingId.trim().toLocaleLowerCase()
+    if (normalizedMappingId && typeof encryptedPassword === 'string' && encryptedPassword) {
+      passwords[normalizedMappingId] = encryptedPassword
+    }
+  }
+  return passwords
+}
+
 async function loadStoredSettings(): Promise<StoredSettings> {
   try {
     const data = JSON.parse(await readFile(settingsPath(), 'utf8')) as StoredSettings
     return {
       command: typeof data.command === 'string' ? data.command : undefined,
       argumentsTemplate: typeof data.argumentsTemplate === 'string' ? data.argumentsTemplate : undefined,
-      recentRepositories: normalizeRecentRepositories(data.recentRepositories)
+      recentRepositories: normalizeRecentRepositories(data.recentRepositories),
+      sshRepositoryMappings: normalizeSshRepositoryMappings(data.sshRepositoryMappings),
+      sshRepositoryPasswords: normalizeStoredSshPasswords(data.sshRepositoryPasswords)
     }
   } catch {
     return {}
@@ -220,6 +280,69 @@ async function saveExternalDiffSettings(settings: ExternalDiffSettings): Promise
     settings: { ...current, command: settings.command, argumentsTemplate: settings.argumentsTemplate },
     result: undefined
   }))
+}
+
+async function listSshRepositoryMappings(): Promise<SshRepositoryMapping[]> {
+  return (await loadStoredSettings()).sshRepositoryMappings ?? []
+}
+
+async function saveSshRepositoryMappings(mappings: SshRepositoryMapping[]): Promise<SshRepositoryMapping[]> {
+  const normalizedMappings = normalizeSshRepositoryMappings(mappings)
+  const passwordMappingIds = new Set(normalizedMappings
+    .filter((mapping) => mapping.authMethod === 'password')
+    .map((mapping) => mapping.id))
+  const savedMappings = await updateStoredSettings((current) => ({
+    settings: {
+      ...current,
+      sshRepositoryMappings: normalizedMappings,
+      sshRepositoryPasswords: Object.fromEntries(Object.entries(normalizeStoredSshPasswords(current.sshRepositoryPasswords))
+        .filter(([mappingId]) => passwordMappingIds.has(mappingId)))
+    },
+    result: normalizedMappings
+  }))
+  configureSshRepositoryMappings(savedMappings)
+  return savedMappings
+}
+
+async function openRepository(repositoryPath: string): Promise<RepositoryInfo> {
+  // The app is single-instance. Reload mappings before every open so a shell request
+  // is routed correctly even when the window has stayed open across configuration changes.
+  const settings = await loadStoredSettings()
+  configureSshRepositoryMappings(settings.sshRepositoryMappings ?? [])
+  restoreStoredSshPasswords(settings)
+  return getRepositoryInfo(repositoryPath)
+}
+
+async function setStoredSshRepositoryPassword(mappingId: string, password: string, remember: boolean): Promise<void> {
+  const normalizedMappingId = mappingId.trim().toLocaleLowerCase()
+  let encryptedPassword = ''
+  if (remember && password) {
+    if (!safeStorage.isEncryptionAvailable()) {
+      throw new Error('Windows 凭据加密当前不可用，无法安全保存 SSH 密码。')
+    }
+    encryptedPassword = safeStorage.encryptString(password).toString('base64')
+  }
+  await updateStoredSettings((current) => {
+    const passwords = normalizeStoredSshPasswords(current.sshRepositoryPasswords)
+    if (remember && password) passwords[normalizedMappingId] = encryptedPassword
+    else if (!remember) delete passwords[normalizedMappingId]
+    return {
+      settings: { ...current, sshRepositoryPasswords: passwords },
+      result: undefined
+    }
+  })
+  if (password || !remember) setSshRepositoryPassword(normalizedMappingId, password)
+}
+
+function restoreStoredSshPasswords(settings: StoredSettings): void {
+  for (const [mappingId, encryptedPassword] of Object.entries(settings.sshRepositoryPasswords ?? {})) {
+    try {
+      if (!safeStorage.isEncryptionAvailable()) continue
+      setSshRepositoryPassword(mappingId, safeStorage.decryptString(Buffer.from(encryptedPassword, 'base64')))
+    } catch {
+      // Ignore malformed or unavailable credentials. The user can enter a new password in SSH mappings.
+    }
+  }
 }
 
 async function listRecentRepositories(): Promise<RecentRepository[]> {
@@ -309,69 +432,7 @@ async function exportChangedPaths(repositoryPath: string, hash: string): Promise
     filters: [{ name: '文本文件', extensions: ['txt'] }, { name: '所有文件', extensions: ['*'] }]
   })
   if (result.canceled || !result.filePath) return false
-
-  await new Promise<void>((resolve, reject) => {
-    const child = spawn('git', [
-      'diff-tree',
-      '--root',
-      '--no-commit-id',
-      '--name-status',
-      '-r',
-      '-M',
-      hash
-    ], {
-      cwd: repositoryPath,
-      windowsHide: true,
-      env: {
-        ...process.env,
-        GIT_OPTIONAL_LOCKS: '0',
-        GIT_PAGER: 'cat'
-      }
-    })
-    const output = createWriteStream(result.filePath)
-    const stderr: Buffer[] = []
-    let stderrSize = 0
-    let finished = false
-    let closed = false
-    let settled = false
-
-    const fail = (error: Error): void => {
-      if (settled) return
-      settled = true
-      child.kill()
-      output.destroy()
-      reject(error)
-    }
-    const complete = (): void => {
-      if (!settled && finished && closed) {
-        settled = true
-        resolve()
-      }
-    }
-
-    child.stdout.pipe(output)
-    child.stderr.on('data', (chunk: Buffer) => {
-      if (stderrSize >= 64 * 1024) return
-      stderrSize += chunk.length
-      stderr.push(chunk)
-    })
-    child.once('error', (error) => fail(new Error(`无法启动 git：${error.message}`)))
-    output.once('error', (error) => fail(new Error(`无法写入导出文件：${error.message}`)))
-    output.once('finish', () => {
-      finished = true
-      complete()
-    })
-    child.once('close', (code) => {
-      if (code !== 0) {
-        const detail = Buffer.concat(stderr).toString('utf8').trim()
-        fail(new Error(detail || 'git diff-tree 导出失败'))
-        return
-      }
-      closed = true
-      complete()
-    })
-  })
-
+  await exportGitChangedPaths(repositoryPath, hash, result.filePath)
   return true
 }
 
@@ -389,9 +450,12 @@ if (!hasSingleInstanceLock) {
   })
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   if (!hasSingleInstanceLock) return
   configureFileChangesCacheDirectory(join(app.getPath('userData'), 'file-changes-cache'))
+  const storedSettings = await loadStoredSettings()
+  configureSshRepositoryMappings(storedSettings.sshRepositoryMappings ?? [])
+  restoreStoredSshPasswords(storedSettings)
   Menu.setApplicationMenu(null)
   createWindow()
 
@@ -407,10 +471,10 @@ app.whenReady().then(() => {
       properties: ['openDirectory']
     })
     if (result.canceled || !result.filePaths[0]) return null
-    return getRepositoryInfo(result.filePaths[0])
+    return openRepository(result.filePaths[0])
   })
 
-  ipcMain.handle('repository:open-recent', (_, repositoryPath: string) => getRepositoryInfo(repositoryPath))
+  ipcMain.handle('repository:open-recent', (_, repositoryPath: string) => openRepository(repositoryPath))
   ipcMain.handle('repository:choose-clone-parent', async () => {
     const result = await dialog.showOpenDialog({
       title: '选择远程仓库保存位置',
@@ -450,6 +514,20 @@ app.whenReady().then(() => {
   ipcMain.handle('recent-repositories:add', (_, repository: RepositoryInfo) => addRecentRepository(repository))
   ipcMain.handle('recent-repositories:remove', (_, repositoryPath: string) => removeRecentRepository(repositoryPath))
   ipcMain.handle('recent-repositories:clear', () => clearRecentRepositories())
+  ipcMain.handle('ssh-mappings:list', () => listSshRepositoryMappings())
+  ipcMain.handle('ssh-mappings:save', (_, mappings: SshRepositoryMapping[]) => saveSshRepositoryMappings(mappings))
+  ipcMain.handle('ssh-mappings:set-password', (_, mappingId: string, password: string, remember: boolean) =>
+    setStoredSshRepositoryPassword(mappingId, password, remember)
+  )
+  ipcMain.handle('ssh-mappings:test', (_, mapping: SshRepositoryMapping, password?: string) => testSshRepositoryMapping(mapping, password))
+  ipcMain.handle('ssh-mappings:choose-identity-file', async () => {
+    const result = await dialog.showOpenDialog({
+      title: '选择 SSH 私钥',
+      properties: ['openFile'],
+      filters: [{ name: 'OpenSSH 私钥', extensions: ['pem', 'key'] }, { name: '所有文件', extensions: ['*'] }]
+    })
+    return result.canceled ? null : (result.filePaths[0] ?? null)
+  })
   ipcMain.handle('settings:external-diff:get', () => loadExternalDiffSettings())
   ipcMain.handle('settings:external-diff:choose', async () => {
     const result = await dialog.showOpenDialog({

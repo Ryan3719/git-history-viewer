@@ -10,6 +10,7 @@ export interface HistoryFilter {
 
 export interface RepositoryInfo {
   path: string
+  displayPath?: string
   name: string
   branch: string
   head: string
@@ -66,6 +67,19 @@ export interface ExternalDiffSettings {
   argumentsTemplate: string
 }
 
+export type SshAuthenticationMethod = 'password' | 'privateKey' | 'agent'
+
+export interface SshRepositoryMapping {
+  id: string
+  localPath: string
+  host: string
+  port: number
+  username: string
+  remotePath: string
+  identityFile: string
+  authMethod: SshAuthenticationMethod
+}
+
 export interface ExternalDiffRequest {
   repositoryPath: string
   commitHash: string
@@ -79,6 +93,11 @@ export interface GitHistoryApi {
   openRecentRepository: (repositoryPath: string) => Promise<RepositoryInfo>
   onRepositoryRequested: (callback: (repositoryPath: string) => void) => () => void
   notifyRepositoryListenerReady: () => Promise<void>
+  listSshRepositoryMappings: () => Promise<SshRepositoryMapping[]>
+  saveSshRepositoryMappings: (mappings: SshRepositoryMapping[]) => Promise<SshRepositoryMapping[]>
+  setSshRepositoryPassword: (mappingId: string, password: string, remember: boolean) => Promise<void>
+  testSshRepositoryMapping: (mapping: SshRepositoryMapping, password?: string) => Promise<void>
+  chooseSshIdentityFile: () => Promise<string | null>
   chooseCloneParent: () => Promise<string | null>
   cloneRemoteRepository: (url: string, destination: string) => Promise<RepositoryInfo>
   listRecentRepositories: () => Promise<RecentRepository[]>

@@ -433,6 +433,46 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .settings-modal { width: min(620px, 100%); }
 
+.ssh-mappings-modal { width: min(760px, 100%); }
+
+.ssh-mapping-form { display: grid; gap: 14px; }
+
+.ssh-mapping-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 12px; }
+
+.ssh-mapping-grid .wide { grid-column: 1 / -1; }
+
+.ssh-mapping-help { display: flex; align-items: flex-start; gap: 8px; padding: 9px 10px; border: 1px solid var(--border); background: var(--surface-muted); color: var(--text-muted); line-height: 1.45; }
+
+.ssh-mapping-help svg { flex: 0 0 auto; margin-top: 1px; color: var(--accent); }
+
+.ssh-mapping-list { display: grid; max-height: min(360px, 46vh); overflow: auto; border: 1px solid var(--border-strong); }
+
+.ssh-mapping-row { display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 10px 12px; border-bottom: 1px solid var(--border); }
+
+.ssh-mapping-row:last-child { border-bottom: 0; }
+
+.ssh-mapping-summary { display: grid; min-width: 0; gap: 3px; }
+
+.ssh-mapping-summary strong, .ssh-mapping-summary span, .ssh-mapping-summary small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.ssh-mapping-summary strong { color: var(--text); font-family: "Cascadia Mono", Consolas, monospace; font-size: 12px; }
+
+.ssh-mapping-summary span { color: var(--text-muted); font-family: "Cascadia Mono", Consolas, monospace; font-size: 11px; }
+
+.ssh-mapping-summary small { color: var(--text-faint); font-size: 11px; }
+
+.ssh-mapping-row-actions { display: flex; align-items: center; gap: 4px; }
+
+.ssh-mapping-empty { display: flex; min-height: 88px; align-items: center; justify-content: center; gap: 9px; padding: 18px; color: var(--text-muted); line-height: 1.45; text-align: center; }
+
+.ssh-mapping-empty svg { flex: 0 0 auto; color: var(--text-faint); }
+
+.ssh-mapping-notice { padding: 9px 10px; border: 1px solid var(--border); line-height: 1.45; }
+
+.ssh-mapping-notice.error { border-color: color-mix(in srgb, var(--removed) 55%, var(--border)); background: var(--removed-bg); color: var(--removed); }
+
+.ssh-mapping-notice.success { border-color: color-mix(in srgb, var(--added) 55%, var(--border)); background: var(--added-bg); color: var(--added); }
+
 .about-modal { width: min(410px, 100%); gap: 0; padding: 0; overflow: hidden; }
 
 .about-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; padding: 20px 20px 18px; }
@@ -497,9 +537,19 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .modal label { display: grid; gap: 6px; color: var(--text-muted); font-size: 12px; font-weight: 650; }
 
-.modal input { width: 100%; height: 36px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--surface-muted); color: var(--text); }
+.modal input, .modal select { width: 100%; height: 36px; padding: 0 9px; border: 1px solid var(--border-strong); border-radius: 4px; background: var(--surface-muted); color: var(--text); }
 
 .path-picker { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
+
+.password-input { position: relative; }
+
+.password-input input { padding-right: 42px; }
+
+.password-visibility-button { position: absolute; top: 2px; right: 2px; width: 32px; height: 32px; }
+
+.modal .ssh-password-remember { display: inline-flex; min-height: 28px; align-items: center; gap: 8px; color: var(--text); font-size: 13px; font-weight: 600; cursor: pointer; }
+
+.modal .ssh-password-remember input { width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
 
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; padding-top: 2px; }
 
@@ -511,6 +561,13 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   .filter-bar { gap: 6px; padding-inline: 10px; }
   .filter-search { min-width: 170px; }
   .date-filter label { font-size: 0; }
+}
+
+@media (max-width: 720px) {
+  .ssh-mapping-grid { grid-template-columns: 1fr; }
+  .ssh-mapping-grid .wide { grid-column: auto; }
+  .ssh-mapping-row { grid-template-columns: minmax(0, 1fr); }
+  .ssh-mapping-row-actions { justify-content: flex-end; }
 }
 
 @media (max-height: 780px) {

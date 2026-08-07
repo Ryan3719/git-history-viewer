@@ -36,6 +36,7 @@ import type {
   HistoryFilter,
   RecentRepository,
   RepositoryInfo,
+  RepositoryOpenRequest,
   SearchScope,
   SshRepositoryMapping
 } from '../../shared/types'
@@ -44,7 +45,7 @@ type Theme = 'light' | 'dark'
 type GettingStartedMode = 'startup' | 'help' | null
 type Notice = { tone: 'error' | 'success'; message: string }
 
-const applicationVersion = '0.0.5'
+const applicationVersion = '0.0.6'
 const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
@@ -91,7 +92,14 @@ function emptySshRepositoryMapping(): SshRepositoryMapping {
 }
 
 function repositoryDisplayPath(repository: RepositoryInfo): string {
-  return repository.displayPath ?? repository.path
+  const rootPath = repository.displayPath ?? repository.path
+  if (!repository.pathScope) return rootPath
+  const separator = rootPath.includes('\\') ? '\\' : '/'
+  return `${rootPath.replace(/[\\/]+$/, '')}${separator}${repository.pathScope}`
+}
+
+function repositoryReferenceKey(repository: RepositoryOpenRequest): string {
+  return `${repository.path}\u0000${repository.pathScope ?? ''}`
 }
 
 function sshMappingSummary(mapping: SshRepositoryMapping): string {
@@ -410,7 +418,13 @@ function App(): React.JSX.Element {
     setLoadingHistory(true)
     setError('')
     try {
-      const result = await window.gitHistory.loadHistory(repository.path, filter, offset)
+      const result = await window.gitHistory.loadHistory(
+        repository.path,
+        repository.pathScope,
+        repository.pathScopeKind,
+        filter,
+        offset
+      )
       if (requestId !== historyRequestRef.current) return
       const next = result.commits
       const knownHashes = new Set(previous.map((commit) => commit.hash))
@@ -460,7 +474,7 @@ function App(): React.JSX.Element {
         if (cancelled) return
         setDetails(next)
         void window.gitHistory
-          .startFileChangesScan(repository.path, next.hash)
+          .startFileChangesScan(repository.path, repository.pathScope, next.hash)
           .then((status) => {
             if (!cancelled) setFileChangesStatus(status)
           })
@@ -490,7 +504,7 @@ function App(): React.JSX.Element {
 
     const pollStatus = async (): Promise<void> => {
       try {
-        const next = await window.gitHistory.getFileChangesStatus(repository.path, details.hash)
+        const next = await window.gitHistory.getFileChangesStatus(repository.path, repository.pathScope, details.hash)
         if (cancelled) return
         setFileChangesStatus(next)
         if (!next.complete) timer = window.setTimeout(() => void pollStatus(), 250)
@@ -516,7 +530,7 @@ function App(): React.JSX.Element {
     filePageRequestsRef.current.add(requestKey)
 
     void window.gitHistory
-      .getFileChangesPage(repository.path, details.hash, page)
+      .getFileChangesPage(repository.path, repository.pathScope, details.hash, page)
         .then((result) => {
           if (generation !== filePageGenerationRef.current) return
           setFileChangesStatus({
@@ -632,11 +646,14 @@ function App(): React.JSX.Element {
     }
   }
 
-  const openRepositoryPath = useCallback(async (repositoryPath: string, failureMessage: string): Promise<void> => {
+  const openRepositoryPath = useCallback(async (
+    repositoryReference: RepositoryOpenRequest,
+    failureMessage: string
+  ): Promise<void> => {
     const requestId = ++repositoryOpenRequestRef.current
     setError('')
     try {
-      const repo = await window.gitHistory.openRecentRepository(repositoryPath)
+      const repo = await window.gitHistory.openRecentRepository(repositoryReference)
       if (requestId === repositoryOpenRequestRef.current) selectRepository(repo)
     } catch (openError) {
       if (requestId === repositoryOpenRequestRef.current) {
@@ -646,20 +663,20 @@ function App(): React.JSX.Element {
   }, [selectRepository])
 
   const openRecentRepository = async (recent: RecentRepository): Promise<void> => {
-    await openRepositoryPath(recent.path, '无法打开该项目。请确认仓库路径仍然可用。')
+    await openRepositoryPath(recent, '无法打开该项目。请确认仓库路径仍然可用。')
   }
 
   useEffect(() => {
-    const removeListener = window.gitHistory.onRepositoryRequested((repositoryPath) => {
-      void openRepositoryPath(repositoryPath, '所选目录不是可读取的 Git 仓库。')
+    const removeListener = window.gitHistory.onRepositoryRequested((repository) => {
+      void openRepositoryPath(repository, '所选路径不在可读取的 Git 仓库中。')
     })
     void window.gitHistory.notifyRepositoryListenerReady()
     return removeListener
   }, [openRepositoryPath])
 
-  const removeRecentRepository = async (repositoryPath: string): Promise<void> => {
+  const removeRecentRepository = async (repository: RepositoryOpenRequest): Promise<void> => {
     try {
-      setRecentRepositories(await window.gitHistory.removeRecentRepository(repositoryPath))
+      setRecentRepositories(await window.gitHistory.removeRecentRepository(repository))
     } catch (removeError) {
       setError(removeError instanceof Error ? removeError.message : '无法移除最近打开的项目。')
     }
@@ -1068,7 +1085,7 @@ function App(): React.JSX.Element {
               </div>
               <div className="recent-repositories-list" role="list">
                 {recentRepositories.map((recent) => (
-                  <div className="recent-repository-row" role="listitem" key={recent.path}>
+                  <div className="recent-repository-row" role="listitem" key={repositoryReferenceKey(recent)}>
                     <button
                       className="recent-repository-open"
                       type="button"
@@ -1087,7 +1104,7 @@ function App(): React.JSX.Element {
                       type="button"
                       aria-label={`从最近打开列表移除 ${recent.name}`}
                       title="从列表移除"
-                      onClick={() => void removeRecentRepository(recent.path)}
+                      onClick={() => void removeRecentRepository(recent)}
                     >
                       <X size={16} />
                     </button>

@@ -1,5 +1,5 @@
 import { app, BrowserWindow, dialog, ipcMain, Menu, safeStorage, shell } from 'electron'
-import { basename, extname, join } from 'node:path'
+import { basename, dirname, extname, join } from 'node:path'
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { spawn } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
@@ -25,6 +25,7 @@ import type {
   HistoryFilter,
   RecentRepository,
   RepositoryInfo,
+  RepositoryOpenRequest,
   SshRepositoryMapping
 } from '../shared/types'
 
@@ -51,16 +52,20 @@ interface StoredSettings {
 
 let settingsWriteQueue = Promise.resolve()
 
-function parseRepositoryPath(argv: string[]): string | null {
+function parseRepositoryPath(argv: string[]): RepositoryOpenRequest | null {
   for (let index = 0; index < argv.length; index += 1) {
     const argument = argv[index]
-    if (argument === '--repo') {
+    if (argument === '--repo' || argument === '--file') {
       const repositoryPath = argv[index + 1]?.trim()
-      return repositoryPath || null
+      return repositoryPath ? { path: repositoryPath, ...(argument === '--file' ? { isFile: true } : {}) } : null
     }
     if (argument.startsWith('--repo=')) {
       const repositoryPath = argument.slice('--repo='.length).trim()
-      return repositoryPath || null
+      return repositoryPath ? { path: repositoryPath } : null
+    }
+    if (argument.startsWith('--file=')) {
+      const repositoryPath = argument.slice('--file='.length).trim()
+      return repositoryPath ? { path: repositoryPath, isFile: true } : null
     }
   }
   return null
@@ -75,14 +80,14 @@ function focusMainWindow(): void {
 
 function sendPendingRepositoryRequest(): void {
   if (!pendingRepositoryPath || !rendererRepositoryListenerReady || !mainWindow || mainWindow.isDestroyed()) return
-  const repositoryPath = pendingRepositoryPath
+  const repository = pendingRepositoryPath
   pendingRepositoryPath = null
-  mainWindow.webContents.send('repository:open-from-shell', repositoryPath)
+  mainWindow.webContents.send('repository:open-from-shell', repository)
 }
 
-function requestRepositoryOpen(repositoryPath: string | null): void {
-  if (!repositoryPath) return
-  pendingRepositoryPath = repositoryPath
+function requestRepositoryOpen(repository: RepositoryOpenRequest | null): void {
+  if (!repository) return
+  pendingRepositoryPath = repository
   focusMainWindow()
   sendPendingRepositoryRequest()
 }
@@ -161,8 +166,17 @@ function settingsPath(): string {
   return join(app.getPath('userData'), 'settings.json')
 }
 
-function repositoryPathKey(repositoryPath: string): string {
-  return repositoryPath.replace(/[\\/]+$/, '').toLocaleLowerCase()
+function repositoryPathKey(repository: Pick<RepositoryInfo, 'path' | 'pathScope'>): string {
+  const root = repository.path.replace(/[\\/]+$/, '').toLocaleLowerCase()
+  const pathScope = (repository.pathScope ?? '').replace(/\\/g, '/').replace(/^\.\//, '').replace(/\/+$/, '').toLocaleLowerCase()
+  return `${root}\u0000${pathScope}`
+}
+
+function normalizeRecentPathScope(value: unknown): string {
+  if (typeof value !== 'string') return ''
+  const segments = value.trim().replace(/\\/g, '/').split('/').filter(Boolean)
+  if (segments.some((segment) => segment === '.' || segment === '..')) return ''
+  return segments.join('/')
 }
 
 function normalizeRecentRepositories(value: unknown): RecentRepository[] {
@@ -180,7 +194,14 @@ function normalizeRecentRepositories(value: unknown): RecentRepository[] {
     ) {
       continue
     }
-    byPath.set(repositoryPathKey(repository.path), repository as RecentRepository)
+    const pathScope = normalizeRecentPathScope(repository.pathScope)
+    const pathScopeKind = repository.pathScopeKind === 'file' ? 'file' : 'directory'
+    const { pathScope: _storedPathScope, pathScopeKind: _storedPathScopeKind, ...repositoryWithoutPathScope } = repository as RecentRepository
+    const normalizedRepository: RecentRepository = {
+      ...repositoryWithoutPathScope,
+      ...(pathScope ? { pathScope, pathScopeKind } : {})
+    }
+    byPath.set(repositoryPathKey(normalizedRepository), normalizedRepository)
   }
   return [...byPath.values()]
     .sort((left, right) => right.lastOpenedAt.localeCompare(left.lastOpenedAt))
@@ -304,13 +325,19 @@ async function saveSshRepositoryMappings(mappings: SshRepositoryMapping[]): Prom
   return savedMappings
 }
 
-async function openRepository(repositoryPath: string): Promise<RepositoryInfo> {
+async function openRepository(repository: RepositoryOpenRequest | string): Promise<RepositoryInfo> {
   // The app is single-instance. Reload mappings before every open so a shell request
   // is routed correctly even when the window has stayed open across configuration changes.
   const settings = await loadStoredSettings()
   configureSshRepositoryMappings(settings.sshRepositoryMappings ?? [])
   restoreStoredSshPasswords(settings)
-  return getRepositoryInfo(repositoryPath)
+  const request: RepositoryOpenRequest = typeof repository === 'string' ? { path: repository } : repository
+  if (request.isFile) {
+    const parentRepository = await getRepositoryInfo(dirname(request.path))
+    const pathScope = [parentRepository.pathScope, basename(request.path)].filter(Boolean).join('/')
+    return { ...parentRepository, pathScope, pathScopeKind: 'file' }
+  }
+  return getRepositoryInfo(request.path, request.pathScope, request.pathScopeKind)
 }
 
 async function setStoredSshRepositoryPassword(mappingId: string, password: string, remember: boolean): Promise<void> {
@@ -354,16 +381,16 @@ async function addRecentRepository(repository: RepositoryInfo): Promise<RecentRe
     const record: RecentRepository = { ...repository, lastOpenedAt: new Date().toISOString() }
     const recentRepositories = normalizeRecentRepositories([
       record,
-      ...(current.recentRepositories ?? []).filter((item) => repositoryPathKey(item.path) !== repositoryPathKey(repository.path))
+      ...(current.recentRepositories ?? []).filter((item) => repositoryPathKey(item) !== repositoryPathKey(repository))
     ])
     return { settings: { ...current, recentRepositories }, result: recentRepositories }
   })
 }
 
-async function removeRecentRepository(repositoryPath: string): Promise<RecentRepository[]> {
+async function removeRecentRepository(repository: RepositoryOpenRequest): Promise<RecentRepository[]> {
   return updateStoredSettings((current) => {
     const recentRepositories = (current.recentRepositories ?? [])
-      .filter((item) => repositoryPathKey(item.path) !== repositoryPathKey(repositoryPath))
+      .filter((item) => repositoryPathKey(item) !== repositoryPathKey(repository))
     return { settings: { ...current, recentRepositories }, result: recentRepositories }
   })
 }
@@ -474,7 +501,7 @@ app.whenReady().then(async () => {
     return openRepository(result.filePaths[0])
   })
 
-  ipcMain.handle('repository:open-recent', (_, repositoryPath: string) => openRepository(repositoryPath))
+  ipcMain.handle('repository:open-recent', (_, repository: RepositoryOpenRequest) => openRepository(repository))
   ipcMain.handle('repository:choose-clone-parent', async () => {
     const result = await dialog.showOpenDialog({
       title: '选择远程仓库保存位置',
@@ -484,35 +511,35 @@ app.whenReady().then(async () => {
   })
 
   ipcMain.handle('repository:clone', (_, url: string, destination: string) => cloneRemoteRepository(url, destination))
-  ipcMain.handle('history:load', (event, repositoryPath: string, filter: HistoryFilter, offset = 0) =>
-    runLatestRequest(historyLoadRequests, event.sender.id, (signal) => listCommits(repositoryPath, filter, signal, offset))
+  ipcMain.handle('history:load', (event, repositoryPath: string, pathScope: string | undefined, pathScopeKind: RepositoryInfo['pathScopeKind'], filter: HistoryFilter, offset = 0) =>
+    runLatestRequest(historyLoadRequests, event.sender.id, (signal) => listCommits(repositoryPath, pathScope, pathScopeKind, filter, signal, offset))
   )
   ipcMain.handle('history:cancel', (event) => abortRequestsForWebContents(event.sender.id))
   ipcMain.handle('history:details', (event, repositoryPath: string, hash: string) =>
     runLatestRequest(historyDetailRequests, event.sender.id, (signal) => getCommitDetails(repositoryPath, hash, signal))
   )
-  ipcMain.handle('history:file-changes:start', async (event, repositoryPath: string, hash: string) => {
+  ipcMain.handle('history:file-changes:start', async (event, repositoryPath: string, pathScope: string | undefined, hash: string) => {
     const senderId = event.sender.id
     fileChangesRequests.get(senderId)?.abort()
     const controller = new AbortController()
     fileChangesRequests.set(senderId, controller)
     try {
-      return await startFileChangesScan(repositoryPath, hash, controller.signal)
+      return await startFileChangesScan(repositoryPath, pathScope, hash, controller.signal)
     } catch (error) {
       if (fileChangesRequests.get(senderId) === controller) fileChangesRequests.delete(senderId)
       throw error
     }
   })
-  ipcMain.handle('history:file-changes:status', (_, repositoryPath: string, hash: string) =>
-    getFileChangesStatus(repositoryPath, hash)
+  ipcMain.handle('history:file-changes:status', (_, repositoryPath: string, pathScope: string | undefined, hash: string) =>
+    getFileChangesStatus(repositoryPath, pathScope, hash)
   )
-  ipcMain.handle('history:file-changes-page', (_, repositoryPath: string, hash: string, page: number) =>
-    getFileChangesPage(repositoryPath, hash, page)
+  ipcMain.handle('history:file-changes-page', (_, repositoryPath: string, pathScope: string | undefined, hash: string, page: number) =>
+    getFileChangesPage(repositoryPath, pathScope, hash, page)
   )
   ipcMain.handle('history:export-paths', (_, repositoryPath: string, hash: string) => exportChangedPaths(repositoryPath, hash))
   ipcMain.handle('recent-repositories:list', () => listRecentRepositories())
   ipcMain.handle('recent-repositories:add', (_, repository: RepositoryInfo) => addRecentRepository(repository))
-  ipcMain.handle('recent-repositories:remove', (_, repositoryPath: string) => removeRecentRepository(repositoryPath))
+  ipcMain.handle('recent-repositories:remove', (_, repository: RepositoryOpenRequest) => removeRecentRepository(repository))
   ipcMain.handle('recent-repositories:clear', () => clearRecentRepositories())
   ipcMain.handle('ssh-mappings:list', () => listSshRepositoryMappings())
   ipcMain.handle('ssh-mappings:save', (_, mappings: SshRepositoryMapping[]) => saveSshRepositoryMappings(mappings))

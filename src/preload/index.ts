@@ -4,14 +4,15 @@ import type {
   ExternalDiffSettings,
   HistoryFilter,
   RepositoryInfo,
+  RepositoryOpenRequest,
   SshRepositoryMapping
 } from '../shared/types'
 
 contextBridge.exposeInMainWorld('gitHistory', {
   pickLocalRepository: () => ipcRenderer.invoke('repository:pick-local'),
-  openRecentRepository: (repositoryPath: string) => ipcRenderer.invoke('repository:open-recent', repositoryPath),
-  onRepositoryRequested: (callback: (repositoryPath: string) => void) => {
-    const listener = (_event: Electron.IpcRendererEvent, repositoryPath: string): void => callback(repositoryPath)
+  openRecentRepository: (repository: RepositoryOpenRequest) => ipcRenderer.invoke('repository:open-recent', repository),
+  onRepositoryRequested: (callback: (repository: RepositoryOpenRequest) => void) => {
+    const listener = (_event: Electron.IpcRendererEvent, repository: RepositoryOpenRequest): void => callback(repository)
     ipcRenderer.on('repository:open-from-shell', listener)
     return () => ipcRenderer.removeListener('repository:open-from-shell', listener)
   },
@@ -25,14 +26,14 @@ contextBridge.exposeInMainWorld('gitHistory', {
   cloneRemoteRepository: (url: string, destination: string) => ipcRenderer.invoke('repository:clone', url, destination),
   listRecentRepositories: () => ipcRenderer.invoke('recent-repositories:list'),
   addRecentRepository: (repository: RepositoryInfo) => ipcRenderer.invoke('recent-repositories:add', repository),
-  removeRecentRepository: (repositoryPath: string) => ipcRenderer.invoke('recent-repositories:remove', repositoryPath),
+  removeRecentRepository: (repository: RepositoryOpenRequest) => ipcRenderer.invoke('recent-repositories:remove', repository),
   clearRecentRepositories: () => ipcRenderer.invoke('recent-repositories:clear'),
-  loadHistory: (repositoryPath: string, filter: HistoryFilter, offset = 0) => ipcRenderer.invoke('history:load', repositoryPath, filter, offset),
+  loadHistory: (repositoryPath: string, pathScope: string | undefined, pathScopeKind: 'directory' | 'file' | undefined, filter: HistoryFilter, offset = 0) => ipcRenderer.invoke('history:load', repositoryPath, pathScope, pathScopeKind, filter, offset),
   cancelHistoryRequests: () => ipcRenderer.invoke('history:cancel'),
   getCommitDetails: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:details', repositoryPath, hash),
-  startFileChangesScan: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:file-changes:start', repositoryPath, hash),
-  getFileChangesStatus: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:file-changes:status', repositoryPath, hash),
-  getFileChangesPage: (repositoryPath: string, hash: string, page: number) => ipcRenderer.invoke('history:file-changes-page', repositoryPath, hash, page),
+  startFileChangesScan: (repositoryPath: string, pathScope: string | undefined, hash: string) => ipcRenderer.invoke('history:file-changes:start', repositoryPath, pathScope, hash),
+  getFileChangesStatus: (repositoryPath: string, pathScope: string | undefined, hash: string) => ipcRenderer.invoke('history:file-changes:status', repositoryPath, pathScope, hash),
+  getFileChangesPage: (repositoryPath: string, pathScope: string | undefined, hash: string, page: number) => ipcRenderer.invoke('history:file-changes-page', repositoryPath, pathScope, hash, page),
   exportChangedPaths: (repositoryPath: string, hash: string) => ipcRenderer.invoke('history:export-paths', repositoryPath, hash),
   getExternalDiffSettings: () => ipcRenderer.invoke('settings:external-diff:get'),
   chooseExternalDiffTool: () => ipcRenderer.invoke('settings:external-diff:choose'),

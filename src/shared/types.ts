@@ -1,4 +1,5 @@
 export type SearchScope = 'all' | 'message' | 'author' | 'path' | 'hash'
+export type RepositoryPathScopeKind = 'directory' | 'file'
 
 export interface HistoryFilter {
   query: string
@@ -11,9 +12,18 @@ export interface HistoryFilter {
 export interface RepositoryInfo {
   path: string
   displayPath?: string
+  pathScope?: string
+  pathScopeKind?: RepositoryPathScopeKind
   name: string
   branch: string
   head: string
+}
+
+export interface RepositoryOpenRequest {
+  path: string
+  pathScope?: string
+  pathScopeKind?: RepositoryPathScopeKind
+  isFile?: boolean
 }
 
 export interface RecentRepository extends RepositoryInfo {
@@ -90,8 +100,8 @@ export interface ExternalDiffRequest {
 
 export interface GitHistoryApi {
   pickLocalRepository: () => Promise<RepositoryInfo | null>
-  openRecentRepository: (repositoryPath: string) => Promise<RepositoryInfo>
-  onRepositoryRequested: (callback: (repositoryPath: string) => void) => () => void
+  openRecentRepository: (repository: RepositoryOpenRequest) => Promise<RepositoryInfo>
+  onRepositoryRequested: (callback: (repository: RepositoryOpenRequest) => void) => () => void
   notifyRepositoryListenerReady: () => Promise<void>
   listSshRepositoryMappings: () => Promise<SshRepositoryMapping[]>
   saveSshRepositoryMappings: (mappings: SshRepositoryMapping[]) => Promise<SshRepositoryMapping[]>
@@ -102,14 +112,20 @@ export interface GitHistoryApi {
   cloneRemoteRepository: (url: string, destination: string) => Promise<RepositoryInfo>
   listRecentRepositories: () => Promise<RecentRepository[]>
   addRecentRepository: (repository: RepositoryInfo) => Promise<RecentRepository[]>
-  removeRecentRepository: (repositoryPath: string) => Promise<RecentRepository[]>
+  removeRecentRepository: (repository: RepositoryOpenRequest) => Promise<RecentRepository[]>
   clearRecentRepositories: () => Promise<void>
-  loadHistory: (repositoryPath: string, filter: HistoryFilter, offset?: number) => Promise<HistoryPage>
+  loadHistory: (
+    repositoryPath: string,
+    pathScope: string | undefined,
+    pathScopeKind: RepositoryPathScopeKind | undefined,
+    filter: HistoryFilter,
+    offset?: number
+  ) => Promise<HistoryPage>
   cancelHistoryRequests: () => Promise<void>
   getCommitDetails: (repositoryPath: string, hash: string) => Promise<CommitDetails>
-  startFileChangesScan: (repositoryPath: string, hash: string) => Promise<FileChangesStatus>
-  getFileChangesStatus: (repositoryPath: string, hash: string) => Promise<FileChangesStatus>
-  getFileChangesPage: (repositoryPath: string, hash: string, page: number) => Promise<FileChangesPage>
+  startFileChangesScan: (repositoryPath: string, pathScope: string | undefined, hash: string) => Promise<FileChangesStatus>
+  getFileChangesStatus: (repositoryPath: string, pathScope: string | undefined, hash: string) => Promise<FileChangesStatus>
+  getFileChangesPage: (repositoryPath: string, pathScope: string | undefined, hash: string, page: number) => Promise<FileChangesPage>
   exportChangedPaths: (repositoryPath: string, hash: string) => Promise<boolean>
   getExternalDiffSettings: () => Promise<ExternalDiffSettings>
   chooseExternalDiffTool: () => Promise<string | null>

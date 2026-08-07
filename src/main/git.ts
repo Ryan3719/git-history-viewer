@@ -28,7 +28,7 @@ const FILE_CHANGES_PAGE_SIZE = 200
 const INITIAL_FILE_CHANGES_AVAILABLE = 50
 const MAX_FILE_CHANGES_CACHES = 4
 const MAX_RENAME_CANDIDATES = 2_000
-const FILE_CHANGES_CACHE_VERSION = 2
+const FILE_CHANGES_CACHE_VERSION = 3
 const MAX_PERSISTENT_FILE_CHANGES_CACHE_BYTES = 512 * 1024 * 1024
 const MAX_PERSISTENT_FILE_CHANGES_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000
 const SSH_REPOSITORY_PROTOCOL = 'ssh:'
@@ -66,6 +66,7 @@ interface FileChangesCache {
   key: string
   storageKey: string
   repositoryPath: string
+  pathScope: string
   hash: string
   filePath: string
   finalFilePath: string
@@ -90,6 +91,7 @@ const sshRepositoryPasswords = new Map<string, string>()
 interface PersistedFileChangesCache {
   version: number
   repositoryPath: string
+  pathScope: string
   hash: string
   pageOffsets: number[]
   total: number
@@ -114,6 +116,16 @@ function normalizeRemotePath(value: string, allowEmpty = false): string {
     throw new Error('服务器仓库路径必须是以 / 开头的绝对路径。')
   }
   return normalized.replace(/\/+$/, '')
+}
+
+function normalizePathScope(value: string | undefined): string {
+  const trimmed = value?.trim().replace(/\\/g, '/') ?? ''
+  if (!trimmed) return ''
+  if (trimmed.startsWith('/')) throw new Error('仓库子目录范围必须是相对路径。')
+  const normalized = posix.normalize(trimmed).replace(/^\.\//, '').replace(/\/+$/, '')
+  if (!normalized || normalized === '.') return ''
+  if (normalized === '..' || normalized.startsWith('../')) throw new Error('仓库子目录范围无效。')
+  return normalized
 }
 
 function normalizeSshAuthenticationMethod(value: unknown, identityFile: string): SshAuthenticationMethod {
@@ -604,11 +616,22 @@ async function tryGitText(cwd: string | undefined, args: string[]): Promise<stri
   }
 }
 
-export async function getRepositoryInfo(repositoryPath: string): Promise<RepositoryInfo> {
+export async function getRepositoryInfo(
+  repositoryPath: string,
+  requestedPathScope?: string,
+  requestedPathScopeKind?: RepositoryInfo['pathScopeKind']
+): Promise<RepositoryInfo> {
   const resolvedRepositoryPath = await resolveRepositoryPath(repositoryPath)
   let root: string
+  let pathScope = ''
   try {
-    root = await runGitText(resolvedRepositoryPath, ['rev-parse', '--show-toplevel'])
+    const [repositoryRoot = '', selectedPathScope = ''] = (await runGit(resolvedRepositoryPath, [
+      'rev-parse',
+      '--show-toplevel',
+      '--show-prefix'
+    ])).toString('utf8').split(/\r?\n/)
+    root = repositoryRoot.trim()
+    pathScope = normalizePathScope(requestedPathScope ?? selectedPathScope)
   } catch (error) {
     const message = error instanceof Error ? error.message : ''
     if (/not a git repository|不是.*git.*仓库/i.test(message)) {
@@ -625,6 +648,7 @@ export async function getRepositoryInfo(repositoryPath: string): Promise<Reposit
   return {
     path: canonicalPath,
     displayPath: sshLocation ? `${sshTarget(sshLocation.mapping)}:${root}` : undefined,
+    ...(pathScope ? { pathScope, pathScopeKind: requestedPathScopeKind ?? 'directory' } : {}),
     name: segments.at(-1) || root,
     branch,
     head
@@ -664,13 +688,15 @@ function dateArguments(filter: HistoryFilter): string[] {
   return args
 }
 
-function pathspecFor(query: string): string {
+function pathspecFor(query: string, pathScope = ''): string {
   const normalized = query.replace(/\\/g, '/')
-  return `:(glob)**/*${normalized}*`
+  return `:(glob)${pathScope ? `${pathScope}/` : ''}**/*${normalized}*`
 }
 
 export async function listCommits(
   repositoryPath: string,
+  pathScope: string | undefined,
+  pathScopeKind: RepositoryInfo['pathScopeKind'],
   filter: HistoryFilter,
   signal?: AbortSignal,
   offset = 0
@@ -690,7 +716,14 @@ export async function listCommits(
 
   if (query && filter.scope === 'message') args.push(`--grep=${query}`)
   if (query && filter.scope === 'author') args.push(`--author=${query}`)
-  if (query && filter.scope === 'path') args.push('--', pathspecFor(query))
+  const normalizedPathScope = normalizePathScope(pathScope)
+  if (query && filter.scope === 'path') {
+    args.push('--', pathScopeKind === 'file' && normalizedPathScope
+      ? normalizedPathScope
+      : pathspecFor(query, normalizedPathScope))
+  } else if (normalizedPathScope) {
+    args.push('--', normalizedPathScope)
+  }
 
   const rawCommits = parseCommitRecords((await runGit(repositoryPath, args, { signal })).toString('utf8'))
   const hasMore = rawCommits.length > pageLimit
@@ -720,12 +753,12 @@ function normalizeStatus(value: string): ChangeStatus {
   return 'X'
 }
 
-function fileChangesCacheKey(repositoryPath: string, hash: string): string {
-  return `${repositoryPath}\u0000${hash}`
+function fileChangesCacheKey(repositoryPath: string, pathScope: string, hash: string): string {
+  return `${repositoryPath}\u0000${pathScope}\u0000${hash}`
 }
 
-function fileChangesStorageKey(repositoryPath: string, hash: string): string {
-  return createHash('sha256').update(fileChangesCacheKey(repositoryPath, hash)).digest('hex')
+function fileChangesStorageKey(repositoryPath: string, pathScope: string, hash: string): string {
+  return createHash('sha256').update(fileChangesCacheKey(repositoryPath, pathScope, hash)).digest('hex')
 }
 
 function currentFileChangesCacheDirectory(): string {
@@ -774,7 +807,13 @@ function fileChangesStatus(cache: FileChangesCache): FileChangesStatus {
   }
 }
 
-function isValidPersistedCache(value: unknown, fileSize: number, repositoryPath: string, hash: string): value is PersistedFileChangesCache {
+function isValidPersistedCache(
+  value: unknown,
+  fileSize: number,
+  repositoryPath: string,
+  pathScope: string,
+  hash: string
+): value is PersistedFileChangesCache {
   if (!value || typeof value !== 'object') return false
   const cache = value as Partial<PersistedFileChangesCache>
   const total = cache.total
@@ -782,6 +821,7 @@ function isValidPersistedCache(value: unknown, fileSize: number, repositoryPath:
   if (
     cache.version !== FILE_CHANGES_CACHE_VERSION ||
     cache.repositoryPath !== repositoryPath ||
+    cache.pathScope !== pathScope ||
     cache.hash !== hash ||
     typeof total !== 'number' ||
     !Number.isSafeInteger(total) ||
@@ -853,7 +893,7 @@ async function loadPersistentFileChangesCache(cache: FileChangesCache): Promise<
       stat(cache.finalFilePath)
     ])
     const metadata = JSON.parse(rawMetadata) as unknown
-    if (!isValidPersistedCache(metadata, fileInfo.size, cache.repositoryPath, cache.hash)) {
+    if (!isValidPersistedCache(metadata, fileInfo.size, cache.repositoryPath, cache.pathScope, cache.hash)) {
       throw new Error('变更路径缓存无效')
     }
 
@@ -879,6 +919,7 @@ async function persistFileChangesCache(cache: FileChangesCache): Promise<void> {
   const metadata: PersistedFileChangesCache = {
     version: FILE_CHANGES_CACHE_VERSION,
     repositoryPath: cache.repositoryPath,
+    pathScope: cache.pathScope,
     hash: cache.hash,
     pageOffsets: cache.pageOffsets,
     total: cache.total
@@ -892,6 +933,7 @@ async function persistFileChangesCache(cache: FileChangesCache): Promise<void> {
 function populateFileChangesCache(
   cache: FileChangesCache,
   repositoryPath: string,
+  pathScope: string,
   hash: string,
   signal?: AbortSignal
 ): Promise<void> {
@@ -911,7 +953,8 @@ function populateFileChangesCache(
         '-M',
         `-l${MAX_RENAME_CANDIDATES}`,
         '-z',
-        hash
+        hash,
+        ...(pathScope ? ['--', pathScope] : [])
       ], { environment: { LC_ALL: 'C', LANG: 'C' } })
     } catch (error) {
       reject(error)
@@ -1038,7 +1081,7 @@ async function initializeFileChangesCache(
   if (await loadPersistentFileChangesCache(cache)) return
 
   cache.filePath = `${cache.finalFilePath}.${randomUUID()}.part`
-  cache.completion = populateFileChangesCache(cache, cache.repositoryPath, cache.hash, signal)
+  cache.completion = populateFileChangesCache(cache, cache.repositoryPath, cache.pathScope, cache.hash, signal)
     .then(async () => {
       await persistFileChangesCache(cache)
       cache.availableCount = cache.total
@@ -1063,10 +1106,12 @@ async function initializeFileChangesCache(
 
 async function getFileChangesCache(
   repositoryPath: string,
+  pathScope: string | undefined,
   hash: string,
   signal?: AbortSignal
 ): Promise<FileChangesCache> {
-  const key = fileChangesCacheKey(repositoryPath, hash)
+  const normalizedPathScope = normalizePathScope(pathScope)
+  const key = fileChangesCacheKey(repositoryPath, normalizedPathScope, hash)
   const existing = fileChangesCaches.get(key)
   if (existing) {
     await existing.initialized
@@ -1074,12 +1119,13 @@ async function getFileChangesCache(
     return existing
   }
 
-  const storageKey = fileChangesStorageKey(repositoryPath, hash)
+  const storageKey = fileChangesStorageKey(repositoryPath, normalizedPathScope, hash)
   const directory = currentFileChangesCacheDirectory()
   const cache: FileChangesCache = {
     key,
     storageKey,
     repositoryPath,
+    pathScope: normalizedPathScope,
     hash,
     filePath: '',
     finalFilePath: join(directory, `${storageKey}.paths.ndjson`),
@@ -1144,15 +1190,20 @@ async function readFileChangesPage(cache: FileChangesCache, page: number): Promi
 
 export async function startFileChangesScan(
   repositoryPath: string,
+  pathScope: string | undefined,
   hash: string,
   signal?: AbortSignal
 ): Promise<FileChangesStatus> {
-  const cache = await getFileChangesCache(repositoryPath, hash, signal)
+  const cache = await getFileChangesCache(repositoryPath, pathScope, hash, signal)
   return fileChangesStatus(cache)
 }
 
-export async function getFileChangesStatus(repositoryPath: string, hash: string): Promise<FileChangesStatus> {
-  const cache = fileChangesCaches.get(fileChangesCacheKey(repositoryPath, hash))
+export async function getFileChangesStatus(
+  repositoryPath: string,
+  pathScope: string | undefined,
+  hash: string
+): Promise<FileChangesStatus> {
+  const cache = fileChangesCaches.get(fileChangesCacheKey(repositoryPath, normalizePathScope(pathScope), hash))
   if (!cache) throw abortError()
   await cache.initialized
   if (cache.error) throw cache.error
@@ -1161,11 +1212,12 @@ export async function getFileChangesStatus(repositoryPath: string, hash: string)
 
 export async function getFileChangesPage(
   repositoryPath: string,
+  pathScope: string | undefined,
   hash: string,
   page: number,
   signal?: AbortSignal
 ): Promise<FileChangesPage> {
-  const cache = await getFileChangesCache(repositoryPath, hash, signal)
+  const cache = await getFileChangesCache(repositoryPath, pathScope, hash, signal)
   const normalizedPage = Math.max(0, Math.floor(page))
   await waitForFileChangesPage(cache, normalizedPage)
   const changes = await readFileChangesPage(cache, normalizedPage)

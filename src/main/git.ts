@@ -1,6 +1,6 @@
 import { spawn } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { createWriteStream, readFileSync } from 'node:fs'
+import { createWriteStream } from 'node:fs'
 import { access, mkdir, open, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { dirname, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
@@ -17,7 +17,6 @@ import type {
   HistoryFilter,
   HistoryPage,
   RepositoryInfo,
-  SshAuthenticationMethod,
   SshRepositoryMapping
 } from '../shared/types'
 
@@ -103,14 +102,8 @@ function abortError(): Error {
   return error
 }
 
-function normalizeWindowsPath(value: string): string {
+function normalizeRemotePath(value: string): string {
   const trimmed = value.trim()
-  return trimmed ? win32.normalize(trimmed).replace(/[\\/]+$/, '').toLocaleLowerCase() : ''
-}
-
-function normalizeRemotePath(value: string, allowEmpty = false): string {
-  const trimmed = value.trim()
-  if (allowEmpty && !trimmed) return ''
   const normalized = posix.normalize(trimmed)
   if (!normalized.startsWith('/') || normalized === '/') {
     throw new Error('服务器仓库路径必须是以 / 开头的绝对路径。')
@@ -128,32 +121,18 @@ function normalizePathScope(value: string | undefined): string {
   return normalized
 }
 
-function normalizeSshAuthenticationMethod(value: unknown, identityFile: string): SshAuthenticationMethod {
-  if (value === 'password' || value === 'privateKey' || value === 'agent') return value
-  return identityFile ? 'privateKey' : 'agent'
-}
-
 function validateSshRepositoryMapping(mapping: SshRepositoryMapping): SshRepositoryMapping {
-  const localPath = normalizeWindowsPath(mapping.localPath)
   const host = mapping.host.trim()
   const username = mapping.username.trim()
-  const remotePath = normalizeRemotePath(mapping.remotePath, true)
   const port = Math.floor(Number(mapping.port))
   if (!mapping.id.trim() || !host || !username || !Number.isInteger(port) || port < 1 || port > 65535) {
     throw new Error('SSH 服务器配置不完整。请检查主机、用户名和端口。')
   }
-  if (Boolean(localPath) !== Boolean(remotePath)) {
-    throw new Error('Windows 映射路径和服务器路径前缀需同时填写，或同时留空以使用自动识别。')
-  }
   return {
     id: mapping.id.trim().toLocaleLowerCase(),
-    localPath,
     host,
     port,
-    username,
-    remotePath,
-    identityFile: mapping.identityFile.trim(),
-    authMethod: normalizeSshAuthenticationMethod(mapping.authMethod, mapping.identityFile.trim())
+    username
   }
 }
 
@@ -169,17 +148,14 @@ export function configureSshRepositoryMappings(mappings: SshRepositoryMapping[])
   }
   sshRepositoryMappings = next
   for (const mappingId of sshRepositoryPasswords.keys()) {
-    if (next.get(mappingId)?.authMethod !== 'password') sshRepositoryPasswords.delete(mappingId)
+    if (!next.has(mappingId)) sshRepositoryPasswords.delete(mappingId)
   }
 }
 
 export function setSshRepositoryPassword(mappingId: string, password: string): void {
   const normalizedMappingId = mappingId.trim().toLocaleLowerCase()
   if (!sshRepositoryMappings.has(normalizedMappingId)) {
-    throw new Error('找不到需要设置密码的 SSH 映射。请先保存该映射。')
-  }
-  if (sshRepositoryMappings.get(normalizedMappingId)?.authMethod !== 'password') {
-    throw new Error('该 SSH 映射未使用密码认证。请先将认证方式改为“密码”。')
+    throw new Error('找不到需要设置密码的 SSH 服务器。请先保存服务器配置。')
   }
   if (!password) {
     sshRepositoryPasswords.delete(normalizedMappingId)
@@ -217,7 +193,7 @@ function parseSshRepositoryPath(repositoryPath: string | undefined): SshReposito
   const mappingId = decodeURIComponent(url.hostname).toLocaleLowerCase()
   const mapping = sshRepositoryMappings.get(mappingId)
   if (!mapping) {
-    throw new Error('找不到此仓库对应的 SSH 映射。请在 SSH 映射中恢复或重新配置该规则。')
+    throw new Error('找不到此仓库对应的 SSH 服务器。请重新配置服务器。')
   }
   const segments = url.pathname
     .split('/')
@@ -233,22 +209,6 @@ function parseSshRepositoryPath(repositoryPath: string | undefined): SshReposito
     throw new Error('SSH 仓库路径无效。请重新从映射盘打开仓库。')
   }
   return { mapping, remotePath }
-}
-
-function resolveConfiguredRepositoryPath(repositoryPath: string): string | null {
-  if (repositoryPath.startsWith('ssh://')) return repositoryPath
-  const localPath = normalizeWindowsPath(repositoryPath)
-  const mapping = [...sshRepositoryMappings.values()]
-    .filter((item) => item.localPath && item.remotePath)
-    .sort((left, right) => right.localPath.length - left.localPath.length)
-    .find((item) => localPath === item.localPath || localPath.startsWith(`${item.localPath}\\`))
-  if (!mapping) return null
-
-  const relativePath = localPath.slice(mapping.localPath.length).replace(/^\\+/, '')
-  const remotePath = relativePath
-    ? posix.join(mapping.remotePath, ...relativePath.split('\\'))
-    : mapping.remotePath
-  return createSshRepositoryPath(mapping.id, remotePath)
 }
 
 function parseWindowsNetworkLocation(path: string): WindowsNetworkLocation | null {
@@ -322,8 +282,7 @@ function sameNetworkHost(left: string, right: string): boolean {
 }
 
 async function resolveRepositoryPath(repositoryPath: string): Promise<string> {
-  const configuredPath = resolveConfiguredRepositoryPath(repositoryPath)
-  if (configuredPath) return configuredPath
+  if (repositoryPath.startsWith('ssh://')) return repositoryPath
 
   const networkLocation = await getWindowsNetworkLocation(repositoryPath)
   if (!networkLocation) return repositoryPath
@@ -358,44 +317,21 @@ function remoteGitCommand(location: SshRepositoryLocation, args: string[], envir
 }
 
 function missingSshPasswordError(mapping: SshRepositoryMapping): Error {
-  return new Error(`SSH 服务器“${mapping.host}”需要密码。请打开“SSH 映射”，编辑此规则并输入密码后保存。`)
-}
-
-function systemSshAgentPath(): string | undefined {
-  if (process.env.SSH_AUTH_SOCK) return process.env.SSH_AUTH_SOCK
-  return process.platform === 'win32' ? '\\\\.\\pipe\\openssh-ssh-agent' : undefined
+  return new Error(`SSH 服务器“${mapping.host}”需要密码。请编辑该服务器并输入密码后保存。`)
 }
 
 function sshConnectionConfig(mapping: SshRepositoryMapping, password?: string): ConnectConfig {
+  if (!password) throw missingSshPasswordError(mapping)
   const config: ConnectConfig = {
     host: mapping.host,
     port: mapping.port,
     username: mapping.username,
+    password,
+    authHandler: ['password'],
     readyTimeout: 15_000,
     keepaliveInterval: 20_000,
     keepaliveCountMax: 2
   }
-  if (mapping.authMethod === 'password') {
-    if (!password) throw missingSshPasswordError(mapping)
-    config.password = password
-    config.authHandler = ['none', 'password']
-    return config
-  }
-  if (mapping.authMethod === 'privateKey') {
-    if (!mapping.identityFile) throw new Error('SSH 映射选择了指定私钥认证，但尚未选择私钥文件。')
-    try {
-      config.privateKey = readFileSync(mapping.identityFile)
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : '未知错误'
-      throw new Error(`无法读取 SSH 私钥：${detail}`)
-    }
-    config.authHandler = ['none', 'publickey']
-    return config
-  }
-  const agent = systemSshAgentPath()
-  if (!agent) throw new Error('未找到系统 SSH Agent。请启动 ssh-agent，或改用密码/指定私钥认证。')
-  config.agent = agent
-  config.authHandler = ['none', 'agent']
   return config
 }
 

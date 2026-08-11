@@ -77,17 +77,12 @@ export interface ExternalDiffSettings {
   argumentsTemplate: string
 }
 
-export type SshAuthenticationMethod = 'password' | 'privateKey' | 'agent'
-
 export interface SshRepositoryMapping {
   id: string
-  localPath: string
   host: string
   port: number
   username: string
-  remotePath: string
-  identityFile: string
-  authMethod: SshAuthenticationMethod
+  hasStoredPassword?: boolean
 }
 
 export interface ExternalDiffRequest {
@@ -105,9 +100,8 @@ export interface GitHistoryApi {
   notifyRepositoryListenerReady: () => Promise<void>
   listSshRepositoryMappings: () => Promise<SshRepositoryMapping[]>
   saveSshRepositoryMappings: (mappings: SshRepositoryMapping[]) => Promise<SshRepositoryMapping[]>
-  setSshRepositoryPassword: (mappingId: string, password: string, remember: boolean) => Promise<void>
+  setSshRepositoryPassword: (mappingId: string, password: string) => Promise<void>
   testSshRepositoryMapping: (mapping: SshRepositoryMapping, password?: string) => Promise<void>
-  chooseSshIdentityFile: () => Promise<string | null>
   chooseCloneParent: () => Promise<string | null>
   cloneRemoteRepository: (url: string, destination: string) => Promise<RepositoryInfo>
   listRecentRepositories: () => Promise<RecentRepository[]>

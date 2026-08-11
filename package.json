@@ -9,7 +9,6 @@
     "preview": "electron-vite preview",
     "typecheck": "tsc --noEmit",
     "dist:win": "npm run build && electron-builder --win nsis --publish never",
-    "dist:portable": "npm run build && electron-builder --win portable --publish never",
     "dist:unpacked": "npm run build && electron-builder --win dir --publish never",
     "dist:zip": "npm run build && electron-builder --win zip --publish never"
   },
@@ -49,8 +48,7 @@
             "x64"
           ]
         }
-      ],
-      "artifactName": "${productName}-${version}-Portable.${ext}"
+      ]
     },
     "nsis": {
       "include": "build/installer.nsh",
@@ -64,9 +62,6 @@
       "createStartMenuShortcut": true,
       "shortcutName": "Git History Viewer",
       "deleteAppDataOnUninstall": false
-    },
-    "portable": {
-      "unpackDirName": false
     }
   },
   "devDependencies": {

@@ -214,16 +214,12 @@ function normalizeSshRepositoryMappings(value: unknown): SshRepositoryMapping[] 
   for (const item of value) {
     if (!item || typeof item !== 'object') continue
     const mapping = item as Partial<SshRepositoryMapping>
-    const localPath = typeof mapping.localPath === 'string' ? mapping.localPath.trim() : ''
     const host = typeof mapping.host === 'string' ? mapping.host.trim() : ''
     const username = typeof mapping.username === 'string' ? mapping.username.trim() : ''
-    const remotePath = typeof mapping.remotePath === 'string' ? mapping.remotePath.trim() : ''
     const port = Math.floor(Number(mapping.port))
     if (
       !host ||
       !username ||
-      (Boolean(localPath) !== Boolean(remotePath)) ||
-      (remotePath && !remotePath.startsWith('/')) ||
       !Number.isInteger(port) ||
       port < 1 ||
       port > 65535
@@ -233,15 +229,9 @@ function normalizeSshRepositoryMappings(value: unknown): SshRepositoryMapping[] 
     const id = typeof mapping.id === 'string' && mapping.id.trim() ? mapping.id.trim().toLocaleLowerCase() : randomUUID()
     mappings.set(id, {
       id,
-      localPath,
       host,
       port,
-      username,
-      remotePath,
-      identityFile: typeof mapping.identityFile === 'string' ? mapping.identityFile.trim() : '',
-      authMethod: mapping.authMethod === 'password' || mapping.authMethod === 'privateKey' || mapping.authMethod === 'agent'
-        ? mapping.authMethod
-        : (typeof mapping.identityFile === 'string' && mapping.identityFile.trim() ? 'privateKey' : 'agent')
+      username
     })
   }
   return [...mappings.values()]
@@ -304,25 +294,34 @@ async function saveExternalDiffSettings(settings: ExternalDiffSettings): Promise
 }
 
 async function listSshRepositoryMappings(): Promise<SshRepositoryMapping[]> {
-  return (await loadStoredSettings()).sshRepositoryMappings ?? []
+  const settings = await loadStoredSettings()
+  const passwords = normalizeStoredSshPasswords(settings.sshRepositoryPasswords)
+  return (settings.sshRepositoryMappings ?? []).map((mapping) => ({
+    ...mapping,
+    hasStoredPassword: Boolean(passwords[mapping.id])
+  }))
 }
 
 async function saveSshRepositoryMappings(mappings: SshRepositoryMapping[]): Promise<SshRepositoryMapping[]> {
   const normalizedMappings = normalizeSshRepositoryMappings(mappings)
-  const passwordMappingIds = new Set(normalizedMappings
-    .filter((mapping) => mapping.authMethod === 'password')
-    .map((mapping) => mapping.id))
-  const savedMappings = await updateStoredSettings((current) => ({
-    settings: {
-      ...current,
-      sshRepositoryMappings: normalizedMappings,
-      sshRepositoryPasswords: Object.fromEntries(Object.entries(normalizeStoredSshPasswords(current.sshRepositoryPasswords))
-        .filter(([mappingId]) => passwordMappingIds.has(mappingId)))
-    },
-    result: normalizedMappings
+  const mappingIds = new Set(normalizedMappings.map((mapping) => mapping.id))
+  const saved = await updateStoredSettings((current) => {
+    const passwords = Object.fromEntries(Object.entries(normalizeStoredSshPasswords(current.sshRepositoryPasswords))
+      .filter(([mappingId]) => mappingIds.has(mappingId)))
+    return {
+      settings: {
+        ...current,
+        sshRepositoryMappings: normalizedMappings,
+        sshRepositoryPasswords: passwords
+      },
+      result: { mappings: normalizedMappings, passwords }
+    }
+  })
+  configureSshRepositoryMappings(saved.mappings)
+  return saved.mappings.map((mapping) => ({
+    ...mapping,
+    hasStoredPassword: Boolean(saved.passwords[mapping.id])
   }))
-  configureSshRepositoryMappings(savedMappings)
-  return savedMappings
 }
 
 async function openRepository(repository: RepositoryOpenRequest | string): Promise<RepositoryInfo> {
@@ -340,25 +339,22 @@ async function openRepository(repository: RepositoryOpenRequest | string): Promi
   return getRepositoryInfo(request.path, request.pathScope, request.pathScopeKind)
 }
 
-async function setStoredSshRepositoryPassword(mappingId: string, password: string, remember: boolean): Promise<void> {
+async function setStoredSshRepositoryPassword(mappingId: string, password: string): Promise<void> {
   const normalizedMappingId = mappingId.trim().toLocaleLowerCase()
-  let encryptedPassword = ''
-  if (remember && password) {
-    if (!safeStorage.isEncryptionAvailable()) {
-      throw new Error('Windows 凭据加密当前不可用，无法安全保存 SSH 密码。')
-    }
-    encryptedPassword = safeStorage.encryptString(password).toString('base64')
+  if (!password) throw new Error('SSH 密码不能为空。')
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('Windows 凭据加密当前不可用，无法安全保存 SSH 密码。')
   }
+  const encryptedPassword = safeStorage.encryptString(password).toString('base64')
   await updateStoredSettings((current) => {
     const passwords = normalizeStoredSshPasswords(current.sshRepositoryPasswords)
-    if (remember && password) passwords[normalizedMappingId] = encryptedPassword
-    else if (!remember) delete passwords[normalizedMappingId]
+    passwords[normalizedMappingId] = encryptedPassword
     return {
       settings: { ...current, sshRepositoryPasswords: passwords },
       result: undefined
     }
   })
-  if (password || !remember) setSshRepositoryPassword(normalizedMappingId, password)
+  setSshRepositoryPassword(normalizedMappingId, password)
 }
 
 function restoreStoredSshPasswords(settings: StoredSettings): void {
@@ -543,18 +539,10 @@ app.whenReady().then(async () => {
   ipcMain.handle('recent-repositories:clear', () => clearRecentRepositories())
   ipcMain.handle('ssh-mappings:list', () => listSshRepositoryMappings())
   ipcMain.handle('ssh-mappings:save', (_, mappings: SshRepositoryMapping[]) => saveSshRepositoryMappings(mappings))
-  ipcMain.handle('ssh-mappings:set-password', (_, mappingId: string, password: string, remember: boolean) =>
-    setStoredSshRepositoryPassword(mappingId, password, remember)
+  ipcMain.handle('ssh-mappings:set-password', (_, mappingId: string, password: string) =>
+    setStoredSshRepositoryPassword(mappingId, password)
   )
   ipcMain.handle('ssh-mappings:test', (_, mapping: SshRepositoryMapping, password?: string) => testSshRepositoryMapping(mapping, password))
-  ipcMain.handle('ssh-mappings:choose-identity-file', async () => {
-    const result = await dialog.showOpenDialog({
-      title: '选择 SSH 私钥',
-      properties: ['openFile'],
-      filters: [{ name: 'OpenSSH 私钥', extensions: ['pem', 'key'] }, { name: '所有文件', extensions: ['*'] }]
-    })
-    return result.canceled ? null : (result.filePaths[0] ?? null)
-  })
   ipcMain.handle('settings:external-diff:get', () => loadExternalDiffSettings())
   ipcMain.handle('settings:external-diff:choose', async () => {
     const result = await dialog.showOpenDialog({

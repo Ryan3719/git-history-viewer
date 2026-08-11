@@ -15,7 +15,6 @@ import {
   FolderOpen,
   GitBranch,
   Info,
-  KeyRound,
   LoaderCircle,
   Moon,
   Network,
@@ -81,13 +80,9 @@ const searchScopes: Array<{ value: SearchScope; label: string }> = [
 function emptySshRepositoryMapping(): SshRepositoryMapping {
   return {
     id: '',
-    localPath: '',
     host: '',
     port: 22,
-    username: '',
-    remotePath: '',
-    identityFile: '',
-    authMethod: 'password'
+    username: ''
   }
 }
 
@@ -103,18 +98,11 @@ function repositoryReferenceKey(repository: RepositoryOpenRequest): string {
 }
 
 function sshMappingSummary(mapping: SshRepositoryMapping): string {
-  if (!mapping.localPath) return `自动识别 ${mapping.host} 的网络盘，服务器目录使用 $HOME`
-  return `${mapping.username}@${mapping.host}:${mapping.remotePath}`
+  return `${mapping.host}:${mapping.port}`
 }
 
 function sshMappingLabel(mapping: SshRepositoryMapping): string {
-  return mapping.localPath || `${mapping.username}@${mapping.host}`
-}
-
-function sshAuthenticationMethodLabel(mapping: SshRepositoryMapping): string {
-  if (mapping.authMethod === 'password') return '密码认证'
-  if (mapping.authMethod === 'privateKey') return '指定私钥'
-  return '系统 SSH Agent'
+  return `${mapping.username}@${mapping.host}`
 }
 
 function formatDate(value: string): string {
@@ -342,9 +330,9 @@ function App(): React.JSX.Element {
   const [sshMappingDraft, setSshMappingDraft] = useState<SshRepositoryMapping | null>(null)
   const [sshMappingPassword, setSshMappingPassword] = useState('')
   const [showSshMappingPassword, setShowSshMappingPassword] = useState(false)
-  const [rememberSshMappingPassword, setRememberSshMappingPassword] = useState(true)
   const [sshMappingNotice, setSshMappingNotice] = useState<Notice | null>(null)
   const [testingSshMapping, setTestingSshMapping] = useState(false)
+  const [savingSshMapping, setSavingSshMapping] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [gettingStartedMode, setGettingStartedMode] = useState<GettingStartedMode>(() => (
     localStorage.getItem('getting-started-dismissed') === 'true' ? null : 'startup'
@@ -743,62 +731,41 @@ function App(): React.JSX.Element {
       setSshMappingDraft(null)
       setSshMappingPassword('')
       setShowSshMappingPassword(false)
-      setRememberSshMappingPassword(true)
       setSshMappingNotice(null)
+      setSavingSshMapping(false)
       setSshMappingsOpen(true)
     } catch (mappingError) {
-      setError(mappingError instanceof Error ? mappingError.message : '无法读取 SSH 映射配置。')
+      setError(mappingError instanceof Error ? mappingError.message : '无法读取 SSH 服务器配置。')
     }
   }
 
   const validateSshMappingDraft = (): SshRepositoryMapping | null => {
     if (!sshMappingDraft) return null
     const mapping: SshRepositoryMapping = {
-      ...sshMappingDraft,
       id: sshMappingDraft.id || crypto.randomUUID(),
-      localPath: sshMappingDraft.localPath.trim(),
       host: sshMappingDraft.host.trim(),
       port: Math.floor(Number(sshMappingDraft.port)),
       username: sshMappingDraft.username.trim(),
-      remotePath: sshMappingDraft.remotePath.trim(),
-      identityFile: sshMappingDraft.identityFile.trim(),
-      authMethod: sshMappingDraft.authMethod
+      hasStoredPassword: sshMappingDraft.hasStoredPassword
     }
     if (!mapping.host || !mapping.username) {
       setSshMappingNotice({ tone: 'error', message: '请填写服务器主机和 SSH 用户名。' })
-      return null
-    }
-    if (Boolean(mapping.localPath) !== Boolean(mapping.remotePath)) {
-      setSshMappingNotice({ tone: 'error', message: 'Windows 映射路径和服务器路径前缀需同时填写，或同时留空以使用自动识别。' })
-      return null
-    }
-    if (mapping.remotePath && !mapping.remotePath.startsWith('/')) {
-      setSshMappingNotice({ tone: 'error', message: '服务器路径必须是以 / 开头的绝对路径。' })
       return null
     }
     if (!Number.isInteger(mapping.port) || mapping.port < 1 || mapping.port > 65535) {
       setSshMappingNotice({ tone: 'error', message: 'SSH 端口必须在 1 到 65535 之间。' })
       return null
     }
-    if (mapping.authMethod === 'privateKey' && !mapping.identityFile) {
-      setSshMappingNotice({ tone: 'error', message: '指定私钥认证需要选择 SSH 私钥文件。' })
+    const existing = sshMappings.find((item) => item.id === mapping.id)
+    if (!sshMappingPassword && !existing?.hasStoredPassword) {
+      setSshMappingNotice({ tone: 'error', message: '请输入 SSH 密码。密码会使用 Windows 凭据加密保存。' })
       return null
     }
-    if (mapping.authMethod === 'password' && !sshMappingPassword && !sshMappings.some((item) => item.id === mapping.id)) {
-      setSshMappingNotice({ tone: 'error', message: '请输入 SSH 密码。勾选“记住密码”后会使用 Windows 加密保存。' })
-      return null
-    }
-    const duplicate = sshMappings.some((item) => {
-      if (item.id === mapping.id) return false
-      if (!mapping.localPath && !item.localPath) {
-        return item.host.toLocaleLowerCase() === mapping.host.toLocaleLowerCase() &&
-          item.username.toLocaleLowerCase() === mapping.username.toLocaleLowerCase() &&
-          item.port === mapping.port
-      }
-      return Boolean(mapping.localPath) && item.localPath.replace(/[\\/]+$/, '').toLocaleLowerCase() === mapping.localPath.replace(/[\\/]+$/, '').toLocaleLowerCase()
-    })
+    const normalizedHost = mapping.host.replace(/^\[|\]$/g, '').toLocaleLowerCase()
+    const duplicate = sshMappings.some((item) => item.id !== mapping.id &&
+      item.host.replace(/^\[|\]$/g, '').toLocaleLowerCase() === normalizedHost)
     if (duplicate) {
-      setSshMappingNotice({ tone: 'error', message: mapping.localPath ? '该映射盘路径已经配置。请编辑已有规则。' : '该 SSH 服务器已经配置为自动识别。请编辑已有规则。' })
+      setSshMappingNotice({ tone: 'error', message: '该服务器地址已经配置。请编辑已有服务器。' })
       return null
     }
     return mapping
@@ -807,22 +774,27 @@ function App(): React.JSX.Element {
   const saveSshMapping = async (): Promise<void> => {
     const mapping = validateSshMappingDraft()
     if (!mapping) return
+    setSavingSshMapping(true)
+    setSshMappingNotice(null)
     try {
       const next = sshMappings.some((item) => item.id === mapping.id)
         ? sshMappings.map((item) => (item.id === mapping.id ? mapping : item))
         : [...sshMappings, mapping]
       const savedMappings = await window.gitHistory.saveSshRepositoryMappings(next)
-      if (mapping.authMethod === 'password' && (sshMappingPassword || !rememberSshMappingPassword)) {
-        await window.gitHistory.setSshRepositoryPassword(mapping.id, sshMappingPassword, rememberSshMappingPassword)
+      if (sshMappingPassword) {
+        await window.gitHistory.setSshRepositoryPassword(mapping.id, sshMappingPassword)
       }
-      setSshMappings(savedMappings)
+      setSshMappings(savedMappings.map((item) => item.id === mapping.id
+        ? { ...item, hasStoredPassword: item.hasStoredPassword || Boolean(sshMappingPassword) }
+        : item))
       setSshMappingDraft(null)
       setSshMappingPassword('')
       setShowSshMappingPassword(false)
-      setRememberSshMappingPassword(true)
-      setSshMappingNotice({ tone: 'success', message: sshMappingPassword && rememberSshMappingPassword ? 'SSH 映射和加密密码已保存。' : 'SSH 映射已保存。右键该映射盘中的目录会自动使用服务器 Git。' })
+      setSshMappingNotice({ tone: 'success', message: 'SSH 服务器已保存。' })
     } catch (mappingError) {
-      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法保存 SSH 映射。' })
+      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法保存 SSH 服务器。' })
+    } finally {
+      setSavingSshMapping(false)
     }
   }
 
@@ -842,20 +814,14 @@ function App(): React.JSX.Element {
   }
 
   const removeSshMapping = async (mapping: SshRepositoryMapping): Promise<void> => {
-    if (!window.confirm(`移除 ${mapping.localPath} 的 SSH 映射？该操作不会影响服务器仓库。`)) return
+    if (!window.confirm(`移除 SSH 服务器 ${sshMappingLabel(mapping)}？`)) return
     try {
       const next = await window.gitHistory.saveSshRepositoryMappings(sshMappings.filter((item) => item.id !== mapping.id))
       setSshMappings(next)
-      setSshMappingNotice({ tone: 'success', message: 'SSH 映射已移除。' })
+      setSshMappingNotice({ tone: 'success', message: 'SSH 服务器已移除。' })
     } catch (mappingError) {
-      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法移除 SSH 映射。' })
+      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法移除 SSH 服务器。' })
     }
-  }
-
-  const chooseSshIdentityFile = async (): Promise<void> => {
-    if (!sshMappingDraft) return
-    const identityFile = await window.gitHistory.chooseSshIdentityFile()
-    if (identityFile) setSshMappingDraft({ ...sshMappingDraft, identityFile })
   }
 
   const closeGettingStarted = (): void => {
@@ -932,46 +898,39 @@ function App(): React.JSX.Element {
     <div className="modal-backdrop" role="presentation">
       <section className="modal ssh-mappings-modal" role="dialog" aria-modal="true" aria-labelledby="ssh-mappings-title">
         <div className="modal-heading">
-          <div><h2 id="ssh-mappings-title">SSH 服务器</h2><p>配置后，右键网络盘中的 Git 仓库会自动在服务器执行 Git。</p></div>
-          <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setSshMappingsOpen(false)}><X size={18} /></button>
+          <div><h2 id="ssh-mappings-title">SSH 服务器</h2><p>管理网络盘仓库使用的服务器账号。</p></div>
+          <button className="icon-button" type="button" aria-label="关闭" title="关闭" disabled={testingSshMapping || savingSshMapping} onClick={() => setSshMappingsOpen(false)}><X size={18} /></button>
         </div>
         {sshMappingDraft ? (
-          <div className="ssh-mapping-form">
+          <form className="ssh-mapping-form" onSubmit={(event) => { event.preventDefault(); void saveSshMapping() }}>
             <div className="ssh-mapping-grid">
-              <label>Windows 映射路径（可选）<input value={sshMappingDraft.localPath} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, localPath: event.target.value })} placeholder="留空时自动识别网络盘" autoFocus /></label>
-              <label>服务器主机（必填）<input value={sshMappingDraft.host} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, host: event.target.value })} placeholder="192.168.160.76" /></label>
-              <label>SSH 用户名（必填）<input value={sshMappingDraft.username} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, username: event.target.value })} placeholder="sunjx" /></label>
-              <label>SSH 端口<input type="number" min="1" max="65535" value={sshMappingDraft.port} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, port: Number(event.target.value) })} /></label>
-              <label className="wide">服务器路径前缀（可选）<input value={sshMappingDraft.remotePath} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, remotePath: event.target.value })} placeholder="留空时使用 SSH 用户主目录" /></label>
-              <label className="wide">认证方式<select value={sshMappingDraft.authMethod} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, authMethod: event.target.value as SshRepositoryMapping['authMethod'] })}><option value="password">密码</option><option value="privateKey">指定私钥</option><option value="agent">系统 SSH Agent</option></select></label>
-              {sshMappingDraft.authMethod === 'password' ? (
-                <><label className="wide">SSH 密码<div className="password-input"><input type={showSshMappingPassword ? 'text' : 'password'} value={sshMappingPassword} onChange={(event) => setSshMappingPassword(event.target.value)} placeholder="输入服务器 SSH 账号密码" autoComplete="current-password" /><button className="icon-button password-visibility-button" type="button" aria-label={showSshMappingPassword ? '隐藏 SSH 密码' : '显示 SSH 密码'} title={showSshMappingPassword ? '隐藏密码' : '显示密码'} onClick={() => setShowSshMappingPassword(!showSshMappingPassword)}>{showSshMappingPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label><label className="ssh-password-remember wide"><input type="checkbox" checked={rememberSshMappingPassword} onChange={(event) => setRememberSshMappingPassword(event.target.checked)} /><span>在此 Windows 帐户中记住密码</span></label></>
-              ) : sshMappingDraft.authMethod === 'privateKey' ? (
-                <label className="wide">SSH 私钥<div className="path-picker"><input value={sshMappingDraft.identityFile} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, identityFile: event.target.value })} placeholder="C:\\Users\\用户名\\.ssh\\id_ed25519" /><button className="secondary-button compact" type="button" onClick={() => void chooseSshIdentityFile()}>浏览</button></div></label>
-              ) : null}
+              <div className="ssh-server-address-row wide">
+                <label><span>服务器地址 <b aria-hidden="true">*</b></span><input value={sshMappingDraft.host} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, host: event.target.value })} placeholder="192.168.160.76" autoComplete="off" required autoFocus /></label>
+                <label><span>端口 <b aria-hidden="true">*</b></span><input type="number" min="1" max="65535" value={sshMappingDraft.port} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, port: Number(event.target.value) })} required /></label>
+              </div>
+              <label className="wide"><span>用户名 <b aria-hidden="true">*</b></span><input value={sshMappingDraft.username} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, username: event.target.value })} placeholder="用户名" autoComplete="username" required /></label>
+              <label className="wide"><span>密码 <b aria-hidden="true">*</b></span><div className="password-input"><input type={showSshMappingPassword ? 'text' : 'password'} value={sshMappingPassword} onChange={(event) => setSshMappingPassword(event.target.value)} placeholder={sshMappingDraft.hasStoredPassword ? '留空则保持现有密码' : '输入 SSH 密码'} autoComplete="current-password" required={!sshMappingDraft.hasStoredPassword} /><button className="icon-button password-visibility-button" type="button" aria-label={showSshMappingPassword ? '隐藏 SSH 密码' : '显示 SSH 密码'} title={showSshMappingPassword ? '隐藏密码' : '显示密码'} onClick={() => setShowSshMappingPassword(!showSshMappingPassword)}>{showSshMappingPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
             </div>
-            <div className="ssh-mapping-help"><KeyRound size={16} aria-hidden="true" /><span>{sshMappingDraft.localPath ? '自定义路径映射：两个路径必须同时填写。' : sshMappingDraft.authMethod === 'password' ? (rememberSshMappingPassword ? '自动识别网络盘，密码会由 Windows 加密保护，可在下次启动时自动使用。' : '自动识别网络盘，密码不会保存，退出软件后需要重新输入。') : sshMappingDraft.authMethod === 'privateKey' ? '自动识别网络盘；私钥文件路径会保存。' : '自动识别网络盘，使用系统 SSH Agent 中已加载的密钥。'}</span></div>
             {sshMappingNotice && <div className={`ssh-mapping-notice ${sshMappingNotice.tone}`} role={sshMappingNotice.tone === 'error' ? 'alert' : 'status'}>{sshMappingNotice.message}</div>}
             <div className="modal-actions">
-              <button className="secondary-button" type="button" onClick={() => { setSshMappingDraft(null); setSshMappingPassword(''); setShowSshMappingPassword(false); setRememberSshMappingPassword(true); setSshMappingNotice(null) }}>返回</button>
-              <button className="secondary-button" type="button" disabled={testingSshMapping} onClick={() => void testSshMapping()}>{testingSshMapping ? <LoaderCircle className="spin" size={17} /> : <Network size={17} />}测试连接</button>
-              <button className="primary-button" type="button" disabled={testingSshMapping} onClick={() => void saveSshMapping()}><Check size={17} />保存映射</button>
+              <button className="secondary-button" type="button" disabled={testingSshMapping || savingSshMapping} onClick={() => void testSshMapping()}>{testingSshMapping ? <LoaderCircle className="spin" size={17} /> : <Network size={17} />}测试连接</button>
+              <button className="primary-button" type="submit" disabled={testingSshMapping || savingSshMapping}>{savingSshMapping ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{savingSshMapping ? '正在保存' : '保存服务器'}</button>
             </div>
-          </div>
+          </form>
         ) : (
           <>
-            <div className="ssh-mapping-list" role="list" aria-label="SSH 映射列表">
+            <div className="ssh-mapping-list" role="list" aria-label="SSH 服务器列表">
               {sshMappings.length === 0 ? (
-                <div className="ssh-mapping-empty"><Server size={20} aria-hidden="true" /><span>尚未配置 SSH 服务器。添加后，右键网络盘中的目录将直接使用服务器 Git。</span></div>
+                <div className="ssh-mapping-empty"><Server size={20} aria-hidden="true" /><span>尚未添加 SSH 服务器</span></div>
               ) : sshMappings.map((mapping) => (
                 <div className="ssh-mapping-row" role="listitem" key={mapping.id}>
-                  <div className="ssh-mapping-summary"><strong>{sshMappingLabel(mapping)}</strong><span title={sshMappingSummary(mapping)}>{sshMappingSummary(mapping)}</span><small title={mapping.authMethod === 'privateKey' ? mapping.identityFile : undefined}>{sshAuthenticationMethodLabel(mapping)}</small></div>
-                  <div className="ssh-mapping-row-actions"><button className="secondary-button compact" type="button" onClick={() => { setSshMappingDraft({ ...mapping }); setSshMappingPassword(''); setShowSshMappingPassword(false); setRememberSshMappingPassword(true); setSshMappingNotice(null) }}>编辑</button><button className="icon-button" type="button" aria-label={`移除 ${mapping.localPath} 的 SSH 映射`} title="移除映射" onClick={() => void removeSshMapping(mapping)}><X size={17} /></button></div>
+                  <div className="ssh-mapping-summary"><strong>{sshMappingLabel(mapping)}</strong><span title={sshMappingSummary(mapping)}>{sshMappingSummary(mapping)}</span><small className={mapping.hasStoredPassword ? '' : 'needs-password'}>{mapping.hasStoredPassword ? '密码已安全保存' : '需要设置密码'}</small></div>
+                  <div className="ssh-mapping-row-actions"><button className="secondary-button compact" type="button" onClick={() => { setSshMappingDraft({ ...mapping }); setSshMappingPassword(''); setShowSshMappingPassword(false); setSshMappingNotice(null) }}>编辑</button><button className="icon-button" type="button" aria-label={`移除 SSH 服务器 ${sshMappingLabel(mapping)}`} title="移除服务器" onClick={() => void removeSshMapping(mapping)}><Trash2 size={17} /></button></div>
                 </div>
               ))}
             </div>
             {sshMappingNotice && <div className={`ssh-mapping-notice ${sshMappingNotice.tone}`} role={sshMappingNotice.tone === 'error' ? 'alert' : 'status'}>{sshMappingNotice.message}</div>}
-            <div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setSshMappingsOpen(false)}>关闭</button><button className="primary-button" type="button" onClick={() => { setSshMappingDraft(emptySshRepositoryMapping()); setSshMappingPassword(''); setShowSshMappingPassword(false); setRememberSshMappingPassword(true); setSshMappingNotice(null) }}><Plus size={17} />添加映射</button></div>
+            <div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setSshMappingsOpen(false)}>关闭</button><button className="primary-button" type="button" onClick={() => { setSshMappingDraft(emptySshRepositoryMapping()); setSshMappingPassword(''); setShowSshMappingPassword(false); setSshMappingNotice(null) }}><Plus size={17} />添加服务器</button></div>
           </>
         )}
       </section>
@@ -1003,30 +962,71 @@ function App(): React.JSX.Element {
       <section className="modal getting-started-modal" role="dialog" aria-modal="true" aria-labelledby="getting-started-title">
         <div className="modal-heading">
           <div>
-            <h2 id="getting-started-title">使用说明</h2>
-            <p>完成以下准备后，即可开始查看 Git 提交历史。</p>
+            <h2 id="getting-started-title">{gettingStartedMode === 'startup' ? '欢迎使用' : '功能说明'}</h2>
+            <p>{gettingStartedMode === 'startup'
+              ? '三步开始查看本地、远程或网络盘仓库历史。'
+              : '了解仓库入口、提交筛选、变更路径与文件对比。'}</p>
           </div>
           <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={closeGettingStarted}><X size={18} /></button>
         </div>
-        <ol className="getting-started-steps">
-          <li>
-            <div>
-              <strong>本地仓库安装 Git for Windows</strong>
-              <a href={gitForWindowsInstallUrl} className="instruction-link" onClick={(event) => { event.preventDefault(); void window.gitHistory.openGitForWindowsDownload() }}>
-                <span>{gitForWindowsInstallUrl}</span><ExternalLink size={14} aria-hidden="true" />
-              </a>
-            </div>
-          </li>
-          <li>
-            <div><strong>配置代码比较工具</strong><button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSettings() }}><Settings size={15} />配置外部对比工具</button></div>
-          </li>
-          <li><div><strong>打开 Git 仓库</strong><span>本地仓库使用本机 Git；映射盘先配置 SSH 映射，右键后由服务器执行 Git。</span><button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />配置 SSH 映射</button></div></li>
-        </ol>
+        {gettingStartedMode === 'startup' ? (
+          <ol className="getting-started-steps">
+            <li>
+              <div>
+                <strong>准备 Git 环境</strong>
+                <span>打开本地仓库和导入远程仓库需要 Git for Windows。</span>
+                <a href={gitForWindowsInstallUrl} className="instruction-link" onClick={(event) => { event.preventDefault(); void window.gitHistory.openGitForWindowsDownload() }}>
+                  <span>{gitForWindowsInstallUrl}</span><ExternalLink size={14} aria-hidden="true" />
+                </a>
+              </div>
+            </li>
+            <li>
+              <div>
+                <strong>选择仓库入口</strong>
+                <span>打开本地目录、导入远程仓库，或在资源管理器中右键目录、目录空白处或文件。</span>
+                <div className="getting-started-actions">
+                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openLocalRepository() }}><FolderOpen size={15} />打开本地仓库</button>
+                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); setRemoteOpen(true) }}><Download size={15} />导入远程仓库</button>
+                </div>
+              </div>
+            </li>
+            <li>
+              <div>
+                <strong>按需配置工具</strong>
+                <span>网络盘仓库使用 SSH 密码服务器；双击变更文件前需配置外部对比工具。</span>
+                <div className="getting-started-actions">
+                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />SSH 服务器</button>
+                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSettings() }}><Settings size={15} />外部对比工具</button>
+                </div>
+              </div>
+            </li>
+          </ol>
+        ) : (
+          <ol className="getting-started-steps">
+            <li><div><strong>打开仓库</strong><span>支持本地目录、最近打开和远程仓库导入。可在资源管理器中右键目录、目录空白处或单个文件，直接查看对应范围的历史。</span></div></li>
+            <li>
+              <div>
+                <strong>访问网络盘仓库</strong>
+                <span>添加与网络盘主机对应的 SSH 服务器，填写地址、端口、用户名和密码。密码由当前 Windows 帐户加密保存，Git 命令在服务器执行。</span>
+                <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />管理 SSH 服务器</button>
+              </div>
+            </li>
+            <li><div><strong>筛选提交</strong><span>可按全部字段、提交信息、作者、文件路径或 Hash 搜索，并组合起止日期；需要时可继续分页加载历史。</span></div></li>
+            <li><div><strong>查看变更路径</strong><span>选择提交后，变更路径会在后台扫描并分页缓存；文件数量较多时也可以边扫描边查看。</span></div></li>
+            <li>
+              <div>
+                <strong>对比文件</strong>
+                <span>配置外部对比工具后，双击变更路径即可查看提交前后的文件差异。</span>
+                <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSettings() }}><Settings size={15} />配置外部对比工具</button>
+              </div>
+            </li>
+          </ol>
+        )}
         <div className={`getting-started-footer ${gettingStartedMode === 'startup' ? 'has-dismissal' : ''}`}>
           {gettingStartedMode === 'startup' && (
-            <label className="check-row"><input type="checkbox" checked={dismissGettingStarted} onChange={(event) => updateGettingStartedDismissal(event.target.checked)} />后续不再提醒</label>
+            <label className="check-row"><input type="checkbox" checked={dismissGettingStarted} onChange={(event) => updateGettingStartedDismissal(event.target.checked)} />启动时不再显示</label>
           )}
-          <button className="primary-button" type="button" onClick={closeGettingStarted}>开始使用</button>
+          <button className="primary-button" type="button" autoFocus onClick={closeGettingStarted}>{gettingStartedMode === 'startup' ? '开始使用' : '关闭'}</button>
         </div>
       </section>
     </div>
@@ -1053,7 +1053,7 @@ function App(): React.JSX.Element {
               <FolderOpen size={15} />打开数据目录
             </button>
             <button className="secondary-button compact" type="button" onClick={() => void openSshMappings()}>
-              <Network size={15} />SSH 映射
+              <Network size={15} />SSH 服务器
             </button>
             <button className="secondary-button compact" type="button" onClick={() => void openSettings()}>
               <Settings size={15} />外部对比工具
@@ -1160,7 +1160,7 @@ function App(): React.JSX.Element {
         <div className="toolbar-center"><span className="branch-chip"><GitBranch size={15} />{repository.branch}</span>{repository.head && <code className="head-chip">{repository.head}</code>}</div>
         <div className="toolbar-actions">
           <button className="secondary-button compact" type="button" onClick={closeRepository}><X size={15} />关闭项目</button>
-          <button className="secondary-button compact" type="button" onClick={() => void openSshMappings()}><Network size={15} />SSH 映射</button>
+          <button className="secondary-button compact" type="button" onClick={() => void openSshMappings()}><Network size={15} />SSH 服务器</button>
           <button className="secondary-button compact" type="button" onClick={() => void openSettings()}><Settings size={15} />外部对比工具</button>
           <button className="icon-button" type="button" title="重新加载提交历史" aria-label="重新加载提交历史" onClick={() => void loadHistory()}><Clock3 size={18} /></button>
           <button className="icon-button" type="button" title="切换主题" aria-label="切换主题" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}</button>

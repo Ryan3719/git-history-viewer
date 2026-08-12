@@ -6,7 +6,6 @@ import {
   Check,
   ChevronDown,
   ChevronRight,
-  Clock3,
   Download,
   Eye,
   EyeOff,
@@ -19,6 +18,7 @@ import {
   Moon,
   Network,
   Plus,
+  RefreshCw,
   Search,
   Server,
   Settings,
@@ -44,7 +44,6 @@ type Theme = 'light' | 'dark'
 type GettingStartedMode = 'startup' | 'help' | null
 type Notice = { tone: 'error' | 'success'; message: string }
 
-const applicationVersion = '0.0.6'
 const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
@@ -57,7 +56,7 @@ type PathsResizeState = {
 const minimumPathsPanelHeight = 160
 const minimumHistoryHeight = 230
 const applicationChromeHeight = 104
-const historyPageSize = 500
+const historyPageSize = 200
 const fileChangesPageSize = 200
 const maxCachedFileChangePages = 5
 
@@ -79,7 +78,7 @@ const searchScopes: Array<{ value: SearchScope; label: string }> = [
 
 function emptySshRepositoryMapping(): SshRepositoryMapping {
   return {
-    id: '',
+    id: crypto.randomUUID(),
     host: '',
     port: 22,
     username: ''
@@ -316,6 +315,7 @@ function App(): React.JSX.Element {
   const [loadingHistory, setLoadingHistory] = useState(false)
   const [historyHasMore, setHistoryHasMore] = useState(false)
   const [loadingDetails, setLoadingDetails] = useState(false)
+  const [openingRepository, setOpeningRepository] = useState(false)
   const [busyMessage, setBusyMessage] = useState('')
   const [error, setError] = useState('')
   const [remoteOpen, setRemoteOpen] = useState(false)
@@ -624,6 +624,7 @@ function App(): React.JSX.Element {
 
   const openLocalRepository = async (): Promise<void> => {
     setError('')
+    setOpeningRepository(true)
     try {
       const repo = await window.gitHistory.pickLocalRepository()
       if (repo) {
@@ -631,6 +632,8 @@ function App(): React.JSX.Element {
       }
     } catch (openError) {
       setError(openError instanceof Error ? openError.message : '所选目录不是可读取的 Git 仓库。')
+    } finally {
+      setOpeningRepository(false)
     }
   }
 
@@ -640,6 +643,7 @@ function App(): React.JSX.Element {
   ): Promise<void> => {
     const requestId = ++repositoryOpenRequestRef.current
     setError('')
+    setOpeningRepository(true)
     try {
       const repo = await window.gitHistory.openRecentRepository(repositoryReference)
       if (requestId === repositoryOpenRequestRef.current) selectRepository(repo)
@@ -647,6 +651,8 @@ function App(): React.JSX.Element {
       if (requestId === repositoryOpenRequestRef.current) {
         setError(openError instanceof Error ? openError.message : failureMessage)
       }
+    } finally {
+      if (requestId === repositoryOpenRequestRef.current) setOpeningRepository(false)
     }
   }, [selectRepository])
 
@@ -950,7 +956,7 @@ function App(): React.JSX.Element {
           <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setAboutOpen(false)}><X size={18} /></button>
         </header>
         <dl className="about-details">
-          <div><dt>版本</dt><dd><code>{applicationVersion}</code></dd></div>
+          <div><dt>版本</dt><dd><code>{__APP_VERSION__}</code></dd></div>
           <div><dt>作者</dt><dd>sunjx</dd></div>
         </dl>
         <div className="about-actions"><button className="secondary-button" type="button" onClick={() => setAboutOpen(false)}>关闭</button></div>
@@ -963,9 +969,7 @@ function App(): React.JSX.Element {
         <div className="modal-heading">
           <div>
             <h2 id="getting-started-title">{gettingStartedMode === 'startup' ? '欢迎使用' : '功能说明'}</h2>
-            <p>{gettingStartedMode === 'startup'
-              ? '三步开始查看本地、远程或网络盘仓库历史。'
-              : '了解仓库入口、提交筛选、变更路径与文件对比。'}</p>
+            {gettingStartedMode === 'startup' && <p>三步开始查看本地、远程或网络盘仓库历史。</p>}
           </div>
           <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={closeGettingStarted}><X size={18} /></button>
         </div>
@@ -1011,8 +1015,6 @@ function App(): React.JSX.Element {
                 <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />管理 SSH 服务器</button>
               </div>
             </li>
-            <li><div><strong>筛选提交</strong><span>可按全部字段、提交信息、作者、文件路径或 Hash 搜索，并组合起止日期；需要时可继续分页加载历史。</span></div></li>
-            <li><div><strong>查看变更路径</strong><span>选择提交后，变更路径会在后台扫描并分页缓存；文件数量较多时也可以边扫描边查看。</span></div></li>
             <li>
               <div>
                 <strong>对比文件</strong>
@@ -1149,6 +1151,7 @@ function App(): React.JSX.Element {
         {sshMappingsDialog}
         {aboutDialog}
         {gettingStartedDialog}
+        {openingRepository && <div className="busy-overlay" role="status" aria-live="polite"><LoaderCircle className="spin" size={24} />正在读取仓库...</div>}
       </main>
     )
   }
@@ -1160,9 +1163,7 @@ function App(): React.JSX.Element {
         <div className="toolbar-center"><span className="branch-chip"><GitBranch size={15} />{repository.branch}</span>{repository.head && <code className="head-chip">{repository.head}</code>}</div>
         <div className="toolbar-actions">
           <button className="secondary-button compact" type="button" onClick={closeRepository}><X size={15} />关闭项目</button>
-          <button className="secondary-button compact" type="button" onClick={() => void openSshMappings()}><Network size={15} />SSH 服务器</button>
-          <button className="secondary-button compact" type="button" onClick={() => void openSettings()}><Settings size={15} />外部对比工具</button>
-          <button className="icon-button" type="button" title="重新加载提交历史" aria-label="重新加载提交历史" onClick={() => void loadHistory()}><Clock3 size={18} /></button>
+          <button className="icon-button" type="button" title="刷新提交历史" aria-label="刷新提交历史" disabled={loadingHistory} onClick={() => void loadHistory()}><RefreshCw className={loadingHistory ? 'spin' : undefined} size={18} /></button>
           <button className="icon-button" type="button" title="切换主题" aria-label="切换主题" onClick={() => setTheme(theme === 'light' ? 'dark' : 'light')}>{theme === 'light' ? <Moon size={18} /> : <Sun size={18} />}</button>
         </div>
       </header>
@@ -1239,7 +1240,8 @@ function App(): React.JSX.Element {
       {settingsDialog}
       {sshMappingsDialog}
 
-      {busyMessage && <div className="busy-overlay"><LoaderCircle className="spin" size={24} />{busyMessage}</div>}
+      {openingRepository && <div className="busy-overlay" role="status" aria-live="polite"><LoaderCircle className="spin" size={24} />正在读取仓库...</div>}
+      {busyMessage && <div className="busy-overlay" role="status" aria-live="polite"><LoaderCircle className="spin" size={24} />{busyMessage}</div>}
     </main>
   )
 }

@@ -30,6 +30,7 @@ const MAX_RENAME_CANDIDATES = 2_000
 const FILE_CHANGES_CACHE_VERSION = 3
 const MAX_PERSISTENT_FILE_CHANGES_CACHE_BYTES = 512 * 1024 * 1024
 const MAX_PERSISTENT_FILE_CHANGES_CACHE_AGE_MS = 30 * 24 * 60 * 60 * 1000
+const MAPPED_DRIVE_NETWORK_ROOT_CACHE_MS = 30_000
 const SSH_REPOSITORY_PROTOCOL = 'ssh:'
 const SSH_AUTO_HOME_PATH_MARKER = '__git_history_viewer_home__'
 
@@ -86,6 +87,8 @@ let fileChangesCacheUsage = 0
 let fileChangesCacheDirectory = ''
 let sshRepositoryMappings = new Map<string, SshRepositoryMapping>()
 const sshRepositoryPasswords = new Map<string, string>()
+const sshRepositoryConnections = new Map<string, SharedSshConnection>()
+const mappedDriveNetworkRoots = new Map<string, { root: string | null; expiresAt: number }>()
 
 interface PersistedFileChangesCache {
   version: number
@@ -146,9 +149,18 @@ export function configureSshRepositoryMappings(mappings: SshRepositoryMapping[])
       // Invalid persisted mappings are ignored until the user corrects them in settings.
     }
   }
+  for (const [mappingId, connection] of sshRepositoryConnections) {
+    const mapping = next.get(mappingId)
+    if (!mapping || !connection.matchesEndpoint(mapping)) {
+      closeSshRepositoryConnection(mappingId)
+    }
+  }
   sshRepositoryMappings = next
   for (const mappingId of sshRepositoryPasswords.keys()) {
-    if (!next.has(mappingId)) sshRepositoryPasswords.delete(mappingId)
+    if (!next.has(mappingId)) {
+      sshRepositoryPasswords.delete(mappingId)
+      closeSshRepositoryConnection(mappingId)
+    }
   }
 }
 
@@ -158,10 +170,22 @@ export function setSshRepositoryPassword(mappingId: string, password: string): v
     throw new Error('找不到需要设置密码的 SSH 服务器。请先保存服务器配置。')
   }
   if (!password) {
+    closeSshRepositoryConnection(normalizedMappingId)
     sshRepositoryPasswords.delete(normalizedMappingId)
     return
   }
+  const mapping = sshRepositoryMappings.get(normalizedMappingId)
+  const connection = sshRepositoryConnections.get(normalizedMappingId)
+  if (!mapping || !connection?.matches(mapping, password)) {
+    closeSshRepositoryConnection(normalizedMappingId)
+  }
   sshRepositoryPasswords.set(normalizedMappingId, password)
+}
+
+export function closeSshRepositoryConnections(): void {
+  for (const mappingId of [...sshRepositoryConnections.keys()]) {
+    closeSshRepositoryConnection(mappingId)
+  }
 }
 
 function createSshRepositoryPath(mappingId: string, remotePath: string): string {
@@ -245,20 +269,28 @@ function runWindowsCommand(command: string, args: string[]): Promise<string> {
 }
 
 async function getMappedDriveNetworkRoot(drive: string): Promise<string | null> {
+  const driveLetter = drive.charAt(0).toLocaleUpperCase()
+  const cached = mappedDriveNetworkRoots.get(driveLetter)
+  if (cached && cached.expiresAt > Date.now()) return cached.root
+
   const systemRoot = process.env.SystemRoot?.trim() || 'C:\\Windows'
   const systemDirectory = join(systemRoot, 'System32')
   const networkOutput = await runWindowsCommand(join(systemDirectory, 'net.exe'), ['use', drive])
   const networkRoot = /\\\\[^\\\s]+\\[^\\\s]+/.exec(networkOutput)?.[0]
-  if (networkRoot) return networkRoot
+  if (networkRoot) {
+    mappedDriveNetworkRoots.set(driveLetter, { root: networkRoot, expiresAt: Date.now() + MAPPED_DRIVE_NETWORK_ROOT_CACHE_MS })
+    return networkRoot
+  }
 
-  const driveLetter = drive.charAt(0).toLocaleUpperCase()
   const registryOutput = await runWindowsCommand(join(systemDirectory, 'reg.exe'), [
     'query',
     `HKCU\\Network\\${driveLetter}`,
     '/v',
     'RemotePath'
   ])
-  return /\\\\[^\\\s]+\\[^\\\s]+/.exec(registryOutput)?.[0] ?? null
+  const registryRoot = /\\\\[^\\\s]+\\[^\\\s]+/.exec(registryOutput)?.[0] ?? null
+  mappedDriveNetworkRoots.set(driveLetter, { root: registryRoot, expiresAt: Date.now() + MAPPED_DRIVE_NETWORK_ROOT_CACHE_MS })
+  return registryRoot
 }
 
 async function getWindowsNetworkLocation(path: string): Promise<WindowsNetworkLocation | null> {
@@ -335,24 +367,130 @@ function sshConnectionConfig(mapping: SshRepositoryMapping, password?: string): 
   return config
 }
 
+class SharedSshConnection {
+  private client: Client | undefined
+  private connectingClient: Client | undefined
+  private connecting: Promise<Client> | undefined
+  private disposed = false
+
+  constructor(
+    private readonly mapping: SshRepositoryMapping,
+    private readonly password: string
+  ) {}
+
+  matchesEndpoint(mapping: SshRepositoryMapping): boolean {
+    return this.mapping.id === mapping.id &&
+      this.mapping.host === mapping.host &&
+      this.mapping.port === mapping.port &&
+      this.mapping.username === mapping.username
+  }
+
+  matches(mapping: SshRepositoryMapping, password?: string): boolean {
+    return this.matchesEndpoint(mapping) && this.password === password
+  }
+
+  acquire(): Promise<Client> {
+    if (this.disposed) return Promise.reject(new Error('SSH 连接已关闭。'))
+    if (this.client) return Promise.resolve(this.client)
+    if (this.connecting) return this.connecting
+
+    const client = new Client()
+    this.connectingClient = client
+    const connecting = new Promise<Client>((resolve, reject) => {
+      let settled = false
+      const rejectConnection = (error: Error): void => {
+        if (settled) return
+        settled = true
+        reject(error)
+      }
+
+      client.once('ready', () => {
+        if (this.disposed) {
+          client.end()
+          rejectConnection(new Error('SSH 连接已关闭。'))
+          return
+        }
+        settled = true
+        this.client = client
+        resolve(client)
+      })
+      client.on('error', (error: Error) => {
+        if (this.client === client) this.client = undefined
+        rejectConnection(error)
+      })
+      client.once('close', () => {
+        if (this.client === client) this.client = undefined
+        rejectConnection(new Error('SSH 连接在命令执行前意外关闭。'))
+      })
+
+      try {
+        client.connect(sshConnectionConfig(this.mapping, this.password))
+      } catch (error) {
+        rejectConnection(error instanceof Error ? error : new Error('无法建立 SSH 连接。'))
+      }
+    })
+    this.connecting = connecting
+    void connecting.finally(() => {
+      if (this.connecting === connecting) this.connecting = undefined
+      if (this.connectingClient === client) this.connectingClient = undefined
+    }).catch(() => undefined)
+    return connecting
+  }
+
+  close(): void {
+    if (this.disposed) return
+    this.disposed = true
+    this.client?.end()
+    if (this.connectingClient && this.connectingClient !== this.client) {
+      this.connectingClient.destroy()
+    }
+    this.client = undefined
+    this.connectingClient = undefined
+  }
+}
+
+function closeSshRepositoryConnection(mappingId: string): void {
+  const connection = sshRepositoryConnections.get(mappingId)
+  if (!connection) return
+  sshRepositoryConnections.delete(mappingId)
+  connection.close()
+}
+
+function getSshRepositoryConnection(
+  mapping: SshRepositoryMapping,
+  password?: string
+): SharedSshConnection {
+  if (!password) throw missingSshPasswordError(mapping)
+  const existing = sshRepositoryConnections.get(mapping.id)
+  if (existing?.matches(mapping, password)) return existing
+  closeSshRepositoryConnection(mapping.id)
+  const connection = new SharedSshConnection(mapping, password)
+  sshRepositoryConnections.set(mapping.id, connection)
+  return connection
+}
+
 class SshCommandProcess extends EventEmitter implements GitCommandProcess {
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
-  private readonly client = new Client()
   private channel: ClientChannel | undefined
   private exitCode: number | null = null
   private closed = false
   private failed = false
   private terminated = false
 
-  constructor(config: ConnectConfig, remoteCommand: string) {
+  constructor(
+    private readonly connection: SharedSshConnection,
+    private readonly remoteCommand: string
+  ) {
     super()
-    this.client.once('ready', () => {
-      if (this.terminated) {
-        this.finishClose(null)
-        return
-      }
-      this.client.exec(remoteCommand, (error, channel) => {
+    void this.start()
+  }
+
+  private async start(): Promise<void> {
+    try {
+      const client = await this.connection.acquire()
+      if (this.closed || this.failed || this.terminated) return
+      client.exec(this.remoteCommand, (error, channel) => {
         if (error) {
           this.fail(error)
           return
@@ -365,14 +503,9 @@ class SshCommandProcess extends EventEmitter implements GitCommandProcess {
         channel.stderr.pipe(this.stderr)
         if (this.terminated) this.kill()
       })
-    })
-    this.client.on('error', (error: Error) => this.fail(error))
-    this.client.once('close', () => {
-      if (!this.closed && !this.failed && !this.terminated) {
-        this.fail(new Error('SSH 连接在命令执行前意外关闭。'))
-      }
-    })
-    this.client.connect(config)
+    } catch (error) {
+      this.fail(error instanceof Error ? error : new Error('无法建立 SSH 连接。'))
+    }
   }
 
   kill(): void {
@@ -383,7 +516,6 @@ class SshCommandProcess extends EventEmitter implements GitCommandProcess {
       this.channel.stderr.unpipe(this.stderr)
       this.channel.close()
     }
-    this.client.end()
     this.finishClose(null)
   }
 
@@ -401,7 +533,6 @@ class SshCommandProcess extends EventEmitter implements GitCommandProcess {
     }
     this.stdout.end()
     this.stderr.end()
-    this.client.end()
     this.emit('error', error)
   }
 
@@ -410,13 +541,12 @@ class SshCommandProcess extends EventEmitter implements GitCommandProcess {
     this.closed = true
     this.stdout.end()
     this.stderr.end()
-    this.client.end()
     this.emit('close', code)
   }
 }
 
 function spawnSshCommand(mapping: SshRepositoryMapping, remoteCommand: string, password?: string): GitCommandProcess {
-  return new SshCommandProcess(sshConnectionConfig(mapping, password), remoteCommand)
+  return new SshCommandProcess(getSshRepositoryConnection(mapping, password), remoteCommand)
 }
 
 function spawnGitProcess(
@@ -450,26 +580,36 @@ function commandLabel(repositoryPath: string | undefined): string {
 
 export async function testSshRepositoryMapping(mapping: SshRepositoryMapping, password?: string): Promise<void> {
   const normalized = validateSshRepositoryMapping(mapping)
-  const child = spawnSshCommand(
-    normalized,
-    shellQuote('git') + ' ' + shellQuote('--version'),
-    password ?? sshRepositoryPasswords.get(normalized.id)
-  )
+  const effectivePassword = password ?? sshRepositoryPasswords.get(normalized.id)
+  if (!effectivePassword) throw missingSshPasswordError(normalized)
+  const configured = sshRepositoryMappings.get(normalized.id)
+  const canReuseConnection = Boolean(configured &&
+    configured.host === normalized.host &&
+    configured.port === normalized.port &&
+    configured.username === normalized.username)
+  const connection = canReuseConnection
+    ? getSshRepositoryConnection(normalized, effectivePassword)
+    : new SharedSshConnection(normalized, effectivePassword)
+  const child = new SshCommandProcess(connection, shellQuote('git') + ' ' + shellQuote('--version'))
   const stderr: Buffer[] = []
   const stdout: Buffer[] = []
-  await new Promise<void>((resolve, reject) => {
-    child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
-    child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
-    child.once('error', (error) => reject(new Error(`SSH 连接失败：${error.message}`)))
-    child.once('close', (code) => {
-      if (code === 0 && /git version/i.test(Buffer.concat(stdout).toString('utf8'))) {
-        resolve()
-        return
-      }
-      const detail = Buffer.concat(stderr).toString('utf8').trim()
-      reject(new Error(detail || 'SSH 连接成功，但服务器无法执行 git --version。'))
+  try {
+    await new Promise<void>((resolve, reject) => {
+      child.stdout.on('data', (chunk: Buffer) => stdout.push(chunk))
+      child.stderr.on('data', (chunk: Buffer) => stderr.push(chunk))
+      child.once('error', (error) => reject(new Error(`SSH 连接失败：${error.message}`)))
+      child.once('close', (code) => {
+        if (code === 0 && /git version/i.test(Buffer.concat(stdout).toString('utf8'))) {
+          resolve()
+          return
+        }
+        const detail = Buffer.concat(stderr).toString('utf8').trim()
+        reject(new Error(detail || 'SSH 连接成功，但服务器无法执行 git --version。'))
+      })
     })
-  })
+  } finally {
+    if (!canReuseConnection) connection.close()
+  }
 }
 
 export function runGit(
@@ -577,8 +717,11 @@ export async function getRepositoryInfo(
   }
   const sshLocation = parseSshRepositoryPath(resolvedRepositoryPath)
   const canonicalPath = sshLocation ? createSshRepositoryPath(sshLocation.mapping.id, root) : root
-  const branch = (await tryGitText(canonicalPath, ['branch', '--show-current'])) || 'DETACHED'
-  const head = await tryGitText(canonicalPath, ['rev-parse', '--short', 'HEAD'])
+  const [branchValue, head] = await Promise.all([
+    tryGitText(canonicalPath, ['branch', '--show-current']),
+    tryGitText(canonicalPath, ['rev-parse', '--short', 'HEAD'])
+  ])
+  const branch = branchValue || 'DETACHED'
   const segments = root.replace(/[\\/]+$/, '').split(/[\\/]/)
 
   return {

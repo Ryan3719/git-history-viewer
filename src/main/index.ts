@@ -6,6 +6,7 @@ import { randomUUID } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import {
   cloneRemoteRepository,
+  closeSshRepositoryConnections,
   configureFileChangesCacheDirectory,
   configureSshRepositoryMappings,
   exportChangedPaths as exportGitChangedPaths,
@@ -51,6 +52,8 @@ interface StoredSettings {
 }
 
 let settingsWriteQueue = Promise.resolve()
+let storedSettingsCache: StoredSettings | undefined
+let settingsLoadPromise: Promise<StoredSettings> | undefined
 
 function parseRepositoryPath(argv: string[]): RepositoryOpenRequest | null {
   for (let index = 0; index < argv.length; index += 1) {
@@ -250,17 +253,29 @@ function normalizeStoredSshPasswords(value: unknown): Record<string, string> {
 }
 
 async function loadStoredSettings(): Promise<StoredSettings> {
-  try {
-    const data = JSON.parse(await readFile(settingsPath(), 'utf8')) as StoredSettings
-    return {
-      command: typeof data.command === 'string' ? data.command : undefined,
-      argumentsTemplate: typeof data.argumentsTemplate === 'string' ? data.argumentsTemplate : undefined,
-      recentRepositories: normalizeRecentRepositories(data.recentRepositories),
-      sshRepositoryMappings: normalizeSshRepositoryMappings(data.sshRepositoryMappings),
-      sshRepositoryPasswords: normalizeStoredSshPasswords(data.sshRepositoryPasswords)
+  if (storedSettingsCache) return storedSettingsCache
+  if (settingsLoadPromise) return settingsLoadPromise
+
+  const loading = (async () => {
+    try {
+      const data = JSON.parse(await readFile(settingsPath(), 'utf8')) as StoredSettings
+      return {
+        command: typeof data.command === 'string' ? data.command : undefined,
+        argumentsTemplate: typeof data.argumentsTemplate === 'string' ? data.argumentsTemplate : undefined,
+        recentRepositories: normalizeRecentRepositories(data.recentRepositories),
+        sshRepositoryMappings: normalizeSshRepositoryMappings(data.sshRepositoryMappings),
+        sshRepositoryPasswords: normalizeStoredSshPasswords(data.sshRepositoryPasswords)
+      }
+    } catch {
+      return {}
     }
-  } catch {
-    return {}
+  })()
+  settingsLoadPromise = loading
+  try {
+    storedSettingsCache = await loading
+    return storedSettingsCache
+  } finally {
+    if (settingsLoadPromise === loading) settingsLoadPromise = undefined
   }
 }
 
@@ -272,6 +287,7 @@ async function updateStoredSettings<T>(
     const next = update(current)
     await mkdir(app.getPath('userData'), { recursive: true })
     await writeFile(settingsPath(), JSON.stringify(next.settings, null, 2), 'utf8')
+    storedSettingsCache = next.settings
     return next.result
   })
   settingsWriteQueue = operation.then(() => undefined, () => undefined)
@@ -325,11 +341,6 @@ async function saveSshRepositoryMappings(mappings: SshRepositoryMapping[]): Prom
 }
 
 async function openRepository(repository: RepositoryOpenRequest | string): Promise<RepositoryInfo> {
-  // The app is single-instance. Reload mappings before every open so a shell request
-  // is routed correctly even when the window has stayed open across configuration changes.
-  const settings = await loadStoredSettings()
-  configureSshRepositoryMappings(settings.sshRepositoryMappings ?? [])
-  restoreStoredSshPasswords(settings)
   const request: RepositoryOpenRequest = typeof repository === 'string' ? { path: repository } : repository
   if (request.isFile) {
     const parentRepository = await getRepositoryInfo(dirname(request.path))
@@ -473,14 +484,13 @@ if (!hasSingleInstanceLock) {
   })
 }
 
-app.whenReady().then(async () => {
+app.whenReady().then(() => {
   if (!hasSingleInstanceLock) return
-  configureFileChangesCacheDirectory(join(app.getPath('userData'), 'file-changes-cache'))
-  const storedSettings = await loadStoredSettings()
-  configureSshRepositoryMappings(storedSettings.sshRepositoryMappings ?? [])
-  restoreStoredSshPasswords(storedSettings)
+  const sshSettingsReady = loadStoredSettings().then((storedSettings) => {
+    configureSshRepositoryMappings(storedSettings.sshRepositoryMappings ?? [])
+    restoreStoredSshPasswords(storedSettings)
+  })
   Menu.setApplicationMenu(null)
-  createWindow()
 
   ipcMain.handle('app:repository-listener-ready', (event) => {
     if (event.sender !== mainWindow?.webContents) return
@@ -494,10 +504,14 @@ app.whenReady().then(async () => {
       properties: ['openDirectory']
     })
     if (result.canceled || !result.filePaths[0]) return null
+    await sshSettingsReady
     return openRepository(result.filePaths[0])
   })
 
-  ipcMain.handle('repository:open-recent', (_, repository: RepositoryOpenRequest) => openRepository(repository))
+  ipcMain.handle('repository:open-recent', async (_, repository: RepositoryOpenRequest) => {
+    await sshSettingsReady
+    return openRepository(repository)
+  })
   ipcMain.handle('repository:choose-clone-parent', async () => {
     const result = await dialog.showOpenDialog({
       title: '选择远程仓库保存位置',
@@ -562,6 +576,11 @@ app.whenReady().then(async () => {
     if (result) throw new Error(`无法打开应用数据目录：${result}`)
   })
 
+  createWindow()
+  mainWindow?.webContents.once('did-finish-load', () => {
+    configureFileChangesCacheDirectory(join(app.getPath('userData'), 'file-changes-cache'))
+  })
+
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
   })
@@ -569,4 +588,8 @@ app.whenReady().then(async () => {
 
 app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit()
+})
+
+app.on('before-quit', () => {
+  closeSshRepositoryConnections()
 })

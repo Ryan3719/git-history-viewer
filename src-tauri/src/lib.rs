@@ -124,8 +124,14 @@ pub fn run() {
                 forward_repository_request(app, request);
             } else if let Some(window) = app.get_webview_window("main") {
                 let _ = window.unminimize();
-                let _ = window.show();
-                let _ = window.set_focus();
+                if window
+                    .state::<AppState>()
+                    .repository_listener_ready
+                    .load(Ordering::Acquire)
+                {
+                    let _ = window.show();
+                    let _ = window.set_focus();
+                }
             }
         }))
         .invoke_handler(tauri::generate_handler![

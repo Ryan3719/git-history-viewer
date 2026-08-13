@@ -1,6 +1,6 @@
 [package]
 name = "git-history-viewer"
-version = "0.0.9"
+version = "0.1.0"
 description = "A read-only Git history viewer and side-by-side comparison tool."
 authors = ["USM"]
 license = "MIT"

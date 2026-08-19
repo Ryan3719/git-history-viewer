@@ -233,7 +233,15 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .compact { min-height: 30px; padding: 0 9px; font-size: 12px; }
 
-.log-section { display: flex; min-height: 0; flex-direction: column; background: var(--surface); border-bottom: 1px solid var(--section-border); }
+.log-section {
+  --message-disclosure-size: 26px;
+  --message-disclosure-gap: 4px;
+  display: flex;
+  min-height: 0;
+  flex-direction: column;
+  background: var(--surface);
+  border-bottom: 1px solid var(--section-border);
+}
 
 .table-header, .log-row {
   display: grid;
@@ -253,6 +261,8 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   font-weight: 650;
   text-transform: uppercase;
 }
+
+.message-column-heading { padding-left: calc(var(--message-disclosure-size) + var(--message-disclosure-gap)); }
 
 .log-table-scroll { position: relative; min-height: 0; overflow: auto; background: var(--surface); }
 
@@ -303,9 +313,9 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 .message-cell {
   display: grid;
   min-width: 0;
-  grid-template-columns: 26px minmax(0, 1fr);
+  grid-template-columns: var(--message-disclosure-size) minmax(0, 1fr);
   align-items: center;
-  column-gap: 4px;
+  column-gap: var(--message-disclosure-gap);
   row-gap: 4px;
 }
 
@@ -323,9 +333,9 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 .commit-message-toggle {
   display: inline-grid;
   grid-column: 1;
-  width: 26px;
-  height: 26px;
-  flex: 0 0 26px;
+  width: var(--message-disclosure-size);
+  height: var(--message-disclosure-size);
+  flex: 0 0 var(--message-disclosure-size);
   place-items: center;
   padding: 0;
   border-radius: 4px;

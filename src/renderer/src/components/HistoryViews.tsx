@@ -31,7 +31,7 @@ export function HistoryTable({
         <span>Revision</span>
         <span>Author</span>
         <span>Date</span>
-        <span>Message</span>
+        <span className="message-column-heading">Message</span>
         <span>Refs</span>
       </div>
       <div ref={scrollRef} className="log-table-scroll" role="grid" aria-label="Git 提交历史">

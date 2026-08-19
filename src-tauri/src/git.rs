@@ -6,9 +6,10 @@ use std::{
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicU64, Ordering},
-        Arc, Condvar, Mutex,
+        mpsc, Arc, Condvar, Mutex,
     },
     thread,
+    time::{Duration, Instant, SystemTime},
 };
 
 use percent_encoding::{percent_decode_str, utf8_percent_encode, NON_ALPHANUMERIC};
@@ -16,6 +17,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use url::Url;
+use wait_timeout::ChildExt;
 
 use crate::{
     models::{
@@ -31,8 +33,17 @@ const FILE_CHANGES_PAGE_SIZE: usize = 200;
 const INITIAL_FILE_CHANGES_AVAILABLE: usize = 50;
 const MAX_RENAME_CANDIDATES: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const HISTORY_SEARCH_BATCH_SIZE: usize = 100;
+const MAX_MEMORY_FILE_CHANGES: usize = 32;
+const MAX_PERSISTED_FILE_CHANGES: usize = 256;
+const MAX_PERSISTED_FILE_CHANGES_BYTES: u64 = 256 * 1024 * 1024;
+const MAX_PERSISTED_FILE_CHANGES_AGE: Duration = Duration::from_secs(30 * 24 * 60 * 60);
+const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SSH_HOME_MARKER: &str = "__git_history_viewer_home__";
 const FILE_CHANGES_CACHE_VERSION: u32 = 3;
+const COMMIT_FORMAT: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1f%D";
+const SEARCH_COMMIT_FORMAT: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1f%B";
 
 #[derive(Clone)]
 struct SshLocation {
@@ -59,6 +70,17 @@ struct FileChangesCache {
     progress: Condvar,
 }
 
+struct FileChangesCacheEntry {
+    cache: Arc<FileChangesCache>,
+    last_access: u64,
+}
+
+struct HistorySearchRecord {
+    commit: CommitSummary,
+    message: String,
+    paths: Vec<String>,
+}
+
 #[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct PersistedFileChanges {
@@ -83,7 +105,8 @@ impl FileChangesCache {
 pub struct GitService {
     ssh: Arc<SshManager>,
     file_changes_cache_directory: PathBuf,
-    file_changes: Mutex<HashMap<String, Arc<FileChangesCache>>>,
+    file_changes: Mutex<HashMap<String, FileChangesCacheEntry>>,
+    file_changes_access: AtomicU64,
     history_generation: AtomicU64,
     details_generation: AtomicU64,
     file_changes_generation: AtomicU64,
@@ -92,10 +115,12 @@ pub struct GitService {
 impl GitService {
     pub fn new(ssh: Arc<SshManager>, file_changes_cache_directory: PathBuf) -> Self {
         let _ = fs::create_dir_all(&file_changes_cache_directory);
+        cleanup_persisted_file_changes(&file_changes_cache_directory);
         Self {
             ssh,
             file_changes_cache_directory,
             file_changes: Mutex::new(HashMap::new()),
+            file_changes_access: AtomicU64::new(0),
             history_generation: AtomicU64::new(0),
             details_generation: AtomicU64::new(0),
             file_changes_generation: AtomicU64::new(0),
@@ -133,6 +158,7 @@ impl GitService {
                 ],
                 MAX_OUTPUT_BYTES,
                 || false,
+                GIT_COMMAND_TIMEOUT,
             )
             .map_err(|error| {
                 if error.to_lowercase().contains("not a git repository") {
@@ -198,46 +224,38 @@ impl GitService {
         &self,
         repository_path: &str,
         path_scope: Option<&str>,
-        path_scope_kind: Option<&str>,
+        _path_scope_kind: Option<&str>,
         filter: &HistoryFilter,
         offset: usize,
         request_generation: u64,
     ) -> Result<HistoryPage, String> {
         let query = filter.query.trim();
         let page_limit = filter.limit.max(1);
+        let scope = normalize_path_scope(path_scope.unwrap_or_default())?;
+        if !query.is_empty() {
+            return self.search_commits(
+                repository_path,
+                &scope,
+                filter,
+                offset,
+                page_limit,
+                request_generation,
+            );
+        }
         let mut args = vec![
             "log".into(),
             "--all".into(),
             "--date=iso-strict".into(),
             format!("--max-count={}", page_limit + 1),
-            "--format=%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D".into(),
+            format!("--format={COMMIT_FORMAT}"),
         ];
-        if !filter.from.is_empty() {
-            args.push(format!("--since={}T00:00:00", filter.from));
-        }
-        if !filter.to.is_empty() {
-            args.push(format!("--until={}T23:59:59", filter.to));
-        }
+        append_date_filter(&mut args, filter);
         if offset > 0 {
             args.push(format!("--skip={offset}"));
         }
-        if !query.is_empty() && filter.scope == "message" {
-            args.push(format!("--grep={query}"));
-        }
-        if !query.is_empty() && filter.scope == "author" {
-            args.push(format!("--author={query}"));
-        }
-        let scope = normalize_path_scope(path_scope.unwrap_or_default())?;
-        if !query.is_empty() && filter.scope == "path" {
+        if !scope.is_empty() {
             args.push("--".into());
-            if path_scope_kind == Some("file") && !scope.is_empty() {
-                args.push(scope);
-            } else {
-                args.push(pathspec_for(query, &scope));
-            }
-        } else if !scope.is_empty() {
-            args.push("--".into());
-            args.push(scope);
+            args.push(scope.clone());
         }
 
         let output = String::from_utf8_lossy(&self.run_git(
@@ -245,36 +263,86 @@ impl GitService {
             &args,
             MAX_OUTPUT_BYTES,
             || self.history_generation.load(Ordering::Acquire) != request_generation,
+            GIT_COMMAND_TIMEOUT,
         )?)
         .into_owned();
         let mut commits = parse_commit_records(&output);
         let has_more = commits.len() > page_limit;
         commits.truncate(page_limit);
         let next_offset = offset + commits.len();
-        if !query.is_empty() && !matches!(filter.scope.as_str(), "message" | "author" | "path") {
-            let needle = query.to_lowercase();
-            commits.retain(|commit| {
-                if filter.scope == "hash" {
-                    commit.hash.to_lowercase().starts_with(&needle)
-                } else {
-                    format!(
-                        "{}\n{}\n{}\n{}\n{}",
-                        commit.hash,
-                        commit.subject,
-                        commit.author_name,
-                        commit.author_email,
-                        commit.refs.join("\n")
-                    )
-                    .to_lowercase()
-                    .contains(&needle)
-                }
-            });
-        }
         Ok(HistoryPage {
             commits,
             has_more,
             next_offset,
         })
+    }
+
+    fn search_commits(
+        &self,
+        repository_path: &str,
+        path_scope: &str,
+        filter: &HistoryFilter,
+        offset: usize,
+        page_limit: usize,
+        request_generation: u64,
+    ) -> Result<HistoryPage, String> {
+        let needle = filter.query.trim().to_lowercase();
+        let mut scan_offset = offset;
+        let mut commits = Vec::with_capacity(page_limit);
+        let deadline = Instant::now() + GIT_COMMAND_TIMEOUT;
+
+        loop {
+            let mut args = vec![
+                "log".into(),
+                "--all".into(),
+                "--date=iso-strict".into(),
+                "--name-only".into(),
+                "-z".into(),
+                format!("--max-count={HISTORY_SEARCH_BATCH_SIZE}"),
+                format!("--skip={scan_offset}"),
+                format!("--format={SEARCH_COMMIT_FORMAT}"),
+            ];
+            append_date_filter(&mut args, filter);
+            if !path_scope.is_empty() {
+                args.push("--".into());
+                args.push(path_scope.into());
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err("Git 历史搜索超时。请缩小日期或路径范围后重试。".into());
+            }
+            let output = String::from_utf8_lossy(&self.run_git(
+                Some(repository_path),
+                &args,
+                MAX_OUTPUT_BYTES,
+                || self.history_generation.load(Ordering::Acquire) != request_generation,
+                remaining,
+            )?)
+            .into_owned();
+            let records = parse_history_search_records(&output);
+            let scanned = records.len();
+            for record in records {
+                if history_record_matches(&record, &filter.scope, &needle) {
+                    if commits.len() == page_limit {
+                        return Ok(HistoryPage {
+                            commits,
+                            has_more: true,
+                            next_offset: scan_offset,
+                        });
+                    }
+                    commits.push(record.commit);
+                }
+                scan_offset += 1;
+            }
+            if scanned < HISTORY_SEARCH_BATCH_SIZE {
+                return Ok(HistoryPage {
+                    commits,
+                    has_more: false,
+                    next_offset: scan_offset,
+                });
+            }
+        }
     }
 
     pub fn get_commit_details(
@@ -293,6 +361,7 @@ impl GitService {
             ],
             MAX_OUTPUT_BYTES,
             || self.details_generation.load(Ordering::Acquire) != request_generation,
+            GIT_COMMAND_TIMEOUT,
         )?;
         let text = String::from_utf8_lossy(&output);
         let mut values = text.trim().split(FIELD_SEPARATOR);
@@ -315,13 +384,7 @@ impl GitService {
         let generation = self.file_changes_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let scope = normalize_path_scope(path_scope.as_deref().unwrap_or_default())?;
         let key = file_changes_key(&repository_path, &scope, &hash);
-        if let Some(cache) = self
-            .file_changes
-            .lock()
-            .expect("file changes map lock poisoned")
-            .get(&key)
-            .cloned()
-        {
+        if let Some(cache) = self.cached_file_changes(&key) {
             return Ok(cache.status());
         }
         let cache = Arc::new(FileChangesCache {
@@ -334,16 +397,10 @@ impl GitService {
                 data.changes = changes;
                 data.complete = true;
             }
-            self.file_changes
-                .lock()
-                .expect("file changes map lock poisoned")
-                .insert(key, cache.clone());
+            self.insert_file_changes_cache(key, cache.clone());
             return Ok(cache.status());
         }
-        self.file_changes
-            .lock()
-            .expect("file changes map lock poisoned")
-            .insert(key.clone(), cache.clone());
+        self.insert_file_changes_cache(key.clone(), cache.clone());
         let service = self.clone();
         let worker_cache = cache.clone();
         let worker_key = key.clone();
@@ -366,6 +423,7 @@ impl GitService {
                     drop(data);
                     service.persist_file_changes(&repository_path, &scope, &hash, &changes);
                     worker_cache.progress.notify_all();
+                    service.trim_file_changes_memory();
                 }
                 Err(error) => {
                     data.error = Some(error);
@@ -377,7 +435,7 @@ impl GitService {
                         .expect("file changes map lock poisoned");
                     if caches
                         .get(&worker_key)
-                        .is_some_and(|cache| Arc::ptr_eq(cache, &worker_cache))
+                        .is_some_and(|entry| Arc::ptr_eq(&entry.cache, &worker_cache))
                     {
                         caches.remove(&worker_key);
                     }
@@ -517,6 +575,7 @@ impl GitService {
             ],
             64 * 1024 * 1024,
             || false,
+            GIT_CLONE_TIMEOUT,
         )?;
         self.get_repository_info(destination.to_string_lossy().as_ref(), None, None)
     }
@@ -570,46 +629,49 @@ impl GitService {
         let mut status: Option<String> = None;
         let mut previous_path: Option<String> = None;
         let mut expected_paths = 0_u8;
-        self.run_git_stream(Some(repository_path), &args, |chunk| {
-            if self.file_changes_generation.load(Ordering::Acquire) != generation {
-                return Err("Git 读取已取消。".into());
-            }
-            pending.extend_from_slice(chunk);
-            while let Some(index) = pending.iter().position(|byte| *byte == 0) {
-                let field = String::from_utf8_lossy(&pending[..index]).into_owned();
-                pending.drain(..=index);
-                if expected_paths == 0 {
-                    if field.is_empty() {
-                        continue;
-                    }
-                    let normalized = normalize_status(&field);
-                    expected_paths = if normalized == "R" || normalized == "C" {
-                        2
+        self.run_git_stream_with_timeout(
+            Some(repository_path),
+            &args,
+            GIT_COMMAND_TIMEOUT,
+            || self.file_changes_generation.load(Ordering::Acquire) != generation,
+            |chunk| {
+                pending.extend_from_slice(chunk);
+                while let Some(index) = pending.iter().position(|byte| *byte == 0) {
+                    let field = String::from_utf8_lossy(&pending[..index]).into_owned();
+                    pending.drain(..=index);
+                    if expected_paths == 0 {
+                        if field.is_empty() {
+                            continue;
+                        }
+                        let normalized = normalize_status(&field);
+                        expected_paths = if normalized == "R" || normalized == "C" {
+                            2
+                        } else {
+                            1
+                        };
+                        status = Some(normalized);
+                        previous_path = None;
+                    } else if expected_paths == 2 {
+                        previous_path = Some(field);
+                        expected_paths = 1;
                     } else {
-                        1
-                    };
-                    status = Some(normalized);
-                    previous_path = None;
-                } else if expected_paths == 2 {
-                    previous_path = Some(field);
-                    expected_paths = 1;
-                } else {
-                    let mut data = cache.data.lock().expect("file changes cache lock poisoned");
-                    data.changes.push(FileChange {
-                        status: status.take().unwrap_or_else(|| "X".into()),
-                        path: field,
-                        previous_path: previous_path.take(),
-                    });
-                    expected_paths = 0;
-                    if data.changes.len() == INITIAL_FILE_CHANGES_AVAILABLE
-                        || data.changes.len().is_multiple_of(FILE_CHANGES_PAGE_SIZE)
-                    {
-                        cache.progress.notify_all();
+                        let mut data = cache.data.lock().expect("file changes cache lock poisoned");
+                        data.changes.push(FileChange {
+                            status: status.take().unwrap_or_else(|| "X".into()),
+                            path: field,
+                            previous_path: previous_path.take(),
+                        });
+                        expected_paths = 0;
+                        if data.changes.len() == INITIAL_FILE_CHANGES_AVAILABLE
+                            || data.changes.len().is_multiple_of(FILE_CHANGES_PAGE_SIZE)
+                        {
+                            cache.progress.notify_all();
+                        }
                     }
                 }
-            }
-            Ok(())
-        })
+                Ok(())
+            },
+        )
     }
 
     fn file_changes_cache(
@@ -618,12 +680,52 @@ impl GitService {
         path_scope: &str,
         hash: &str,
     ) -> Result<Arc<FileChangesCache>, String> {
+        self.cached_file_changes(&file_changes_key(repository_path, path_scope, hash))
+            .ok_or_else(|| "Git 读取已取消。".into())
+    }
+
+    fn cached_file_changes(&self, key: &str) -> Option<Arc<FileChangesCache>> {
+        let access = self.file_changes_access.fetch_add(1, Ordering::Relaxed) + 1;
+        let mut caches = self
+            .file_changes
+            .lock()
+            .expect("file changes map lock poisoned");
+        let entry = caches.get_mut(key)?;
+        entry.last_access = access;
+        Some(entry.cache.clone())
+    }
+
+    fn insert_file_changes_cache(&self, key: String, cache: Arc<FileChangesCache>) {
+        let access = self.file_changes_access.fetch_add(1, Ordering::Relaxed) + 1;
         self.file_changes
             .lock()
             .expect("file changes map lock poisoned")
-            .get(&file_changes_key(repository_path, path_scope, hash))
-            .cloned()
-            .ok_or_else(|| "Git 读取已取消。".into())
+            .insert(
+                key,
+                FileChangesCacheEntry {
+                    cache,
+                    last_access: access,
+                },
+            );
+        self.trim_file_changes_memory();
+    }
+
+    fn trim_file_changes_memory(&self) {
+        let mut caches = self
+            .file_changes
+            .lock()
+            .expect("file changes map lock poisoned");
+        while caches.len() > MAX_MEMORY_FILE_CHANGES {
+            let oldest = caches
+                .iter()
+                .filter(|(_, entry)| entry.cache.status().complete)
+                .min_by_key(|(_, entry)| entry.last_access)
+                .map(|(key, _)| key.clone());
+            let Some(oldest) = oldest else {
+                break;
+            };
+            caches.remove(&oldest);
+        }
     }
 
     fn persisted_file_changes_path(
@@ -683,10 +785,11 @@ impl GitService {
             let _ = fs::remove_file(&destination);
             let _ = fs::rename(temporary, destination);
         }
+        cleanup_persisted_file_changes(&self.file_changes_cache_directory);
     }
 
     fn try_git_text(&self, cwd: Option<&str>, args: &[String]) -> Option<String> {
-        self.run_git(cwd, args, MAX_OUTPUT_BYTES, || false)
+        self.run_git(cwd, args, MAX_OUTPUT_BYTES, || false, GIT_COMMAND_TIMEOUT)
             .ok()
             .map(|value| String::from_utf8_lossy(&value).trim().to_string())
     }
@@ -697,12 +800,10 @@ impl GitService {
         args: &[String],
         maximum_output: usize,
         cancelled: impl Fn() -> bool,
+        timeout: Duration,
     ) -> Result<Vec<u8>, String> {
         let mut output = Vec::new();
-        self.run_git_stream(cwd, args, |chunk| {
-            if cancelled() {
-                return Err("Git 读取已取消。".into());
-            }
+        self.run_git_stream_with_timeout(cwd, args, timeout, cancelled, |chunk| {
             if output.len().saturating_add(chunk.len()) > maximum_output {
                 return Err("Git 输出过大，已停止读取。请缩小筛选范围或改用外部对比工具。".into());
             }
@@ -718,14 +819,32 @@ impl GitService {
         args: &[String],
         on_stdout: impl FnMut(&[u8]) -> Result<(), String>,
     ) -> Result<(), String> {
+        self.run_git_stream_with_timeout(cwd, args, GIT_COMMAND_TIMEOUT, || false, on_stdout)
+    }
+
+    fn run_git_stream_with_timeout(
+        &self,
+        cwd: Option<&str>,
+        args: &[String],
+        timeout: Duration,
+        cancelled: impl Fn() -> bool,
+        on_stdout: impl FnMut(&[u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
         if let Some(location) = cwd
             .map(|path| self.parse_ssh_location(path))
             .transpose()?
             .flatten()
         {
             let command = remote_git_command(&location, args);
+            let mut callback = on_stdout;
             self.ssh
-                .execute(&location.mapping, None, &command, on_stdout)?;
+                .execute(&location.mapping, None, &command, timeout, |chunk| {
+                    if cancelled() {
+                        Err("Git 读取已取消。".into())
+                    } else {
+                        callback(chunk)
+                    }
+                })?;
             return Ok(());
         }
         let mut child = Command::new("git")
@@ -748,24 +867,72 @@ impl GitService {
             buffer
         });
         let mut stdout = child.stdout.take().expect("git stdout must be piped");
+        let (stdout_sender, stdout_receiver) = mpsc::channel();
+        let stdout_reader = thread::spawn(move || {
+            let mut buffer = [0_u8; 64 * 1024];
+            loop {
+                match stdout.read(&mut buffer) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        if stdout_sender.send(Ok(buffer[..read].to_vec())).is_err() {
+                            break;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = stdout_sender.send(Err(error));
+                        break;
+                    }
+                }
+            }
+        });
         let mut callback = on_stdout;
-        let mut buffer = [0_u8; 64 * 1024];
+        let deadline = Instant::now() + timeout;
         let stream_result = loop {
-            match stdout.read(&mut buffer) {
-                Ok(0) => break Ok(()),
-                Ok(read) => {
-                    if let Err(error) = callback(&buffer[..read]) {
+            if cancelled() {
+                let _ = child.kill();
+                break Err("Git 读取已取消。".into());
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                let _ = child.kill();
+                break Err(format!(
+                    "git {} 执行超时。请缩小操作范围后重试。",
+                    args.first().map_or("", String::as_str)
+                ));
+            }
+            match stdout_receiver.recv_timeout(remaining.min(Duration::from_millis(200))) {
+                Ok(Ok(chunk)) => {
+                    if let Err(error) = callback(&chunk) {
                         let _ = child.kill();
                         break Err(error);
                     }
                 }
-                Err(error) => break Err(format!("读取 git 输出失败：{error}")),
+                Ok(Err(error)) => {
+                    let _ = child.kill();
+                    break Err(format!("读取 git 输出失败：{error}"));
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => break Ok(()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
             }
         };
-        let status = child
-            .wait()
-            .map_err(|error| format!("等待 git 结束失败：{error}"))?;
+        let status = match child
+            .wait_timeout(deadline.saturating_duration_since(Instant::now()))
+            .map_err(|error| format!("等待 git 结束失败：{error}"))?
+        {
+            Some(status) => status,
+            None => {
+                let _ = child.kill();
+                child
+                    .wait()
+                    .map_err(|error| format!("停止超时 git 任务失败：{error}"))?;
+                return Err(format!(
+                    "git {} 执行超时。请缩小操作范围后重试。",
+                    args.first().map_or("", String::as_str)
+                ));
+            }
+        };
         let stderr = stderr_reader.join().unwrap_or_default();
+        let _ = stdout_reader.join();
         stream_result?;
         if status.success() {
             Ok(())
@@ -883,8 +1050,13 @@ fn parse_commit_records(output: &str) -> Vec<CommitSummary> {
                 author_email: values.get(3).unwrap_or(&"").to_string(),
                 date: values.get(4).unwrap_or(&"").to_string(),
                 subject: values.get(5).unwrap_or(&"").to_string(),
-                refs: values
+                body: values
                     .get(6)
+                    .unwrap_or(&"")
+                    .trim_matches(['\r', '\n'])
+                    .to_string(),
+                refs: values
+                    .get(7)
                     .unwrap_or(&"")
                     .split(',')
                     .map(str::trim)
@@ -894,6 +1066,150 @@ fn parse_commit_records(output: &str) -> Vec<CommitSummary> {
             })
         })
         .collect()
+}
+
+fn parse_history_search_records(output: &str) -> Vec<HistorySearchRecord> {
+    output
+        .split(RECORD_SEPARATOR)
+        .filter_map(|record| {
+            let mut parts = record.split('\0');
+            let metadata = parts.next()?.trim_start_matches(['\r', '\n']);
+            if metadata.is_empty() {
+                return None;
+            }
+            let values: Vec<_> = metadata.split(FIELD_SEPARATOR).collect();
+            let hash = values.first()?.to_string();
+            let subject = values.get(5).unwrap_or(&"").to_string();
+            let message = values.get(7).unwrap_or(&"").trim().to_string();
+            let commit = CommitSummary {
+                short_hash: hash.chars().take(8).collect(),
+                hash,
+                parents: values
+                    .get(1)
+                    .unwrap_or(&"")
+                    .split_whitespace()
+                    .map(str::to_string)
+                    .collect(),
+                author_name: values.get(2).unwrap_or(&"").to_string(),
+                author_email: values.get(3).unwrap_or(&"").to_string(),
+                date: values.get(4).unwrap_or(&"").to_string(),
+                body: message
+                    .strip_prefix(&subject)
+                    .unwrap_or(&message)
+                    .trim_matches(['\r', '\n'])
+                    .to_string(),
+                subject,
+                refs: values
+                    .get(6)
+                    .unwrap_or(&"")
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(str::to_string)
+                    .collect(),
+            };
+            let paths = parts
+                .map(|path| path.trim_matches(['\r', '\n']))
+                .filter(|path| !path.is_empty())
+                .map(str::to_string)
+                .collect();
+            Some(HistorySearchRecord {
+                commit,
+                message,
+                paths,
+            })
+        })
+        .collect()
+}
+
+fn history_record_matches(record: &HistorySearchRecord, scope: &str, needle: &str) -> bool {
+    let message_matches = || record.message.to_lowercase().contains(needle);
+    let author_matches = || {
+        format!(
+            "{}\n{}",
+            record.commit.author_name, record.commit.author_email
+        )
+        .to_lowercase()
+        .contains(needle)
+    };
+    let path_matches = || {
+        record
+            .paths
+            .iter()
+            .any(|path| path.to_lowercase().contains(needle))
+    };
+    let hash_matches = || record.commit.hash.to_lowercase().starts_with(needle);
+    let refs_match = || {
+        record
+            .commit
+            .refs
+            .iter()
+            .any(|reference| reference.to_lowercase().contains(needle))
+    };
+
+    match scope {
+        "message" => message_matches(),
+        "author" => author_matches(),
+        "path" => path_matches(),
+        "hash" => hash_matches(),
+        _ => {
+            message_matches()
+                || author_matches()
+                || path_matches()
+                || hash_matches()
+                || refs_match()
+        }
+    }
+}
+
+fn append_date_filter(args: &mut Vec<String>, filter: &HistoryFilter) {
+    if !filter.from.is_empty() {
+        args.push(format!("--since={}T00:00:00", filter.from));
+    }
+    if !filter.to.is_empty() {
+        args.push(format!("--until={}T23:59:59", filter.to));
+    }
+}
+
+fn cleanup_persisted_file_changes(directory: &Path) {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return;
+    };
+    let now = SystemTime::now();
+    let mut files: Vec<_> = entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.ends_with(".paths.json"))
+            {
+                return None;
+            }
+            let metadata = entry.metadata().ok()?;
+            let modified = metadata.modified().unwrap_or(SystemTime::UNIX_EPOCH);
+            Some((path, metadata.len(), modified))
+        })
+        .collect();
+
+    files.retain(|(path, _, modified)| {
+        let expired = now
+            .duration_since(*modified)
+            .is_ok_and(|age| age > MAX_PERSISTED_FILE_CHANGES_AGE);
+        if expired {
+            let _ = fs::remove_file(path);
+        }
+        !expired
+    });
+    files.sort_by_key(|(_, _, modified)| std::cmp::Reverse(*modified));
+    let mut total_bytes = 0_u64;
+    for (index, (path, length, _)) in files.into_iter().enumerate() {
+        total_bytes = total_bytes.saturating_add(length);
+        if index >= MAX_PERSISTED_FILE_CHANGES || total_bytes > MAX_PERSISTED_FILE_CHANGES_BYTES {
+            let _ = fs::remove_file(path);
+        }
+    }
 }
 
 fn normalize_path_scope(value: &str) -> Result<String, String> {
@@ -936,18 +1252,6 @@ fn normalize_status(value: &str) -> String {
         status @ ('A' | 'M' | 'D' | 'R' | 'C' | 'T' | 'U') => status.to_string(),
         _ => "X".into(),
     }
-}
-
-fn pathspec_for(query: &str, path_scope: &str) -> String {
-    format!(
-        ":(glob){}**/*{}*",
-        if path_scope.is_empty() {
-            String::new()
-        } else {
-            format!("{path_scope}/")
-        },
-        query.replace('\\', "/")
-    )
 }
 
 fn file_changes_key(repository_path: &str, path_scope: &str, hash: &str) -> String {
@@ -1073,6 +1377,31 @@ fn same_network_host(left: &str, right: &str) -> bool {
 mod tests {
     use super::*;
 
+    fn git_service(cache_directory: &Path) -> GitService {
+        GitService::new(
+            Arc::new(SshManager::new(Vec::new(), HashMap::new())),
+            cache_directory.to_path_buf(),
+        )
+    }
+
+    fn search_record() -> HistorySearchRecord {
+        HistorySearchRecord {
+            commit: CommitSummary {
+                hash: "abcdef123456".into(),
+                short_hash: "abcdef12".into(),
+                parents: vec![],
+                author_name: "Ryan".into(),
+                author_email: "ryan@example.com".into(),
+                date: "2026-08-13T10:00:00+08:00".into(),
+                subject: "Improve search".into(),
+                body: "Include file paths".into(),
+                refs: vec!["HEAD -> main".into()],
+            },
+            message: "Improve search\n\nInclude file paths".into(),
+            paths: vec!["src/renderer/App.tsx".into()],
+        }
+    }
+
     #[test]
     fn parses_unc_path() {
         let location = parse_network_path(r"\\server\share\team\repo").unwrap();
@@ -1095,5 +1424,95 @@ mod tests {
             percent_decode_str(parsed.path()).decode_utf8_lossy(),
             "/srv/中文 repo"
         );
+    }
+
+    #[test]
+    fn parses_multiline_commit_body() {
+        let output = "\u{001e}abcdef123456\u{001f}\u{001f}Ryan\u{001f}ryan@example.com\u{001f}2026-08-13T10:00:00+08:00\u{001f}Improve search\u{001f}First detail\n\nSecond detail\n\u{001f}HEAD -> main";
+        let commits = parse_commit_records(output);
+
+        assert_eq!(commits.len(), 1);
+        assert_eq!(commits[0].subject, "Improve search");
+        assert_eq!(commits[0].body, "First detail\n\nSecond detail");
+        assert_eq!(commits[0].refs, ["HEAD -> main"]);
+    }
+
+    #[test]
+    fn all_history_search_includes_paths_and_refs() {
+        let record = search_record();
+        assert!(history_record_matches(&record, "all", "app.tsx"));
+        assert!(history_record_matches(&record, "all", "main"));
+    }
+
+    #[test]
+    fn history_search_respects_selected_scope() {
+        let record = search_record();
+        assert!(history_record_matches(&record, "author", "ryan"));
+        assert!(!history_record_matches(&record, "message", "ryan"));
+        assert!(history_record_matches(&record, "hash", "abcdef"));
+        assert!(!history_record_matches(&record, "hash", "bcdef"));
+    }
+
+    #[test]
+    fn parses_search_records_with_null_separated_paths() {
+        let output = "\u{001e}abcdef123456\u{001f}\u{001f}Ryan\u{001f}ryan@example.com\u{001f}2026-08-13T10:00:00+08:00\u{001f}Improve search\u{001f}HEAD -> main\u{001f}Improve search\n\0\nsrc/App.tsx\0";
+        let records = parse_history_search_records(output);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].commit.short_hash, "abcdef12");
+        assert_eq!(records[0].paths, ["src/App.tsx"]);
+    }
+
+    #[test]
+    fn searches_paths_beyond_the_first_result_page() {
+        let repository = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = repository.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "Search Test"]);
+        run(&["config", "user.email", "search@example.com"]);
+
+        for index in 0..5 {
+            let name = if index == 0 {
+                "target-file.txt".to_string()
+            } else {
+                format!("other-{index}.txt")
+            };
+            fs::write(path.join(name), format!("commit {index}")).unwrap();
+            run(&["add", "."]);
+            run(&["commit", "-q", "-m", &format!("commit {index}")]);
+        }
+
+        let service = git_service(cache.path());
+        let filter = HistoryFilter {
+            query: "target-file".into(),
+            scope: "all".into(),
+            from: String::new(),
+            to: String::new(),
+            limit: 1,
+        };
+        let generation = service.next_history_request();
+        let result = service
+            .list_commits(
+                path.to_string_lossy().as_ref(),
+                None,
+                None,
+                &filter,
+                0,
+                generation,
+            )
+            .unwrap();
+
+        assert_eq!(result.commits.len(), 1);
+        assert_eq!(result.commits[0].subject, "commit 0");
+        assert!(!result.has_more);
+        assert_eq!(result.next_offset, 5);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "git-history-viewer"
-version = "0.1.0"
+version = "0.1.1"
 description = "A read-only Git history viewer and side-by-side comparison tool."
 authors = ["USM"]
 license = "MIT"
@@ -32,7 +32,7 @@ tempfile = "3"
 wait-timeout = "0.2"
 url = "2"
 uuid = { version = "1", features = ["v4"] }
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Security_Cryptography", "Win32_Storage_FileSystem"] }
 
 [profile.release]
 codegen-units = 1

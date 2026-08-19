@@ -1,6 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs,
+    fs::{self, File},
+    io::Write,
+    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     sync::Mutex,
 };
@@ -17,6 +19,7 @@ use windows_sys::Win32::{
     Security::Cryptography::{
         CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
     },
+    Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH},
 };
 
 use crate::models::{
@@ -210,19 +213,47 @@ impl SettingsStore {
 
     fn update(&self, operation: impl FnOnce(&mut StoredSettings)) -> Result<(), String> {
         let mut settings = self.settings.lock().expect("settings lock poisoned");
-        operation(&mut settings);
+        let mut next = settings.clone();
+        operation(&mut next);
         fs::create_dir_all(&self.directory)
             .map_err(|error| format!("无法创建应用数据目录：{error}"))?;
         let temporary = self.directory.join("settings.json.tmp");
         let destination = self.directory.join("settings.json");
-        let data = serde_json::to_vec_pretty(&*settings)
+        let data = serde_json::to_vec_pretty(&next)
             .map_err(|error| format!("无法序列化应用设置：{error}"))?;
-        fs::write(&temporary, data).map_err(|error| format!("无法写入应用设置：{error}"))?;
-        if destination.exists() {
-            fs::remove_file(&destination).map_err(|error| format!("无法更新应用设置：{error}"))?;
-        }
-        fs::rename(temporary, destination).map_err(|error| format!("无法更新应用设置：{error}"))
+        let mut file =
+            File::create(&temporary).map_err(|error| format!("无法写入应用设置：{error}"))?;
+        file.write_all(&data)
+            .and_then(|_| file.sync_all())
+            .map_err(|error| format!("无法写入应用设置：{error}"))?;
+        drop(file);
+        replace_file(&temporary, &destination)?;
+        settings.clone_from(&next);
+        Ok(())
     }
+}
+
+fn replace_file(source: &Path, destination: &Path) -> Result<(), String> {
+    let source: Vec<u16> = source.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = destination
+        .as_os_str()
+        .encode_wide()
+        .chain(Some(0))
+        .collect();
+    let success = unsafe {
+        MoveFileExW(
+            source.as_ptr(),
+            destination.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if success == 0 {
+        return Err(format!(
+            "无法更新应用设置：{}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_mappings(value: Vec<SshRepositoryMapping>) -> Vec<SshRepositoryMapping> {
@@ -450,5 +481,24 @@ mod tests {
         let encrypted = protect_password("test-password-123").unwrap();
         let decrypted = unprotect_password(&encrypted, Path::new(".")).unwrap();
         assert_eq!(decrypted, "test-password-123");
+    }
+
+    #[test]
+    fn failed_write_does_not_change_in_memory_settings() {
+        let temporary = tempfile::tempdir().unwrap();
+        let blocker = temporary.path().join("not-a-directory");
+        fs::write(&blocker, b"block").unwrap();
+        let store = SettingsStore {
+            directory: blocker.join("settings"),
+            settings: Mutex::new(StoredSettings::default()),
+        };
+
+        let result = store.save_external_diff(ExternalDiffSettings {
+            command: "diff.exe".into(),
+            arguments_template: "{left} {right}".into(),
+        });
+
+        assert!(result.is_err());
+        assert_eq!(store.external_diff().command, "");
     }
 }

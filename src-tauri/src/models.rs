@@ -53,6 +53,7 @@ pub struct CommitSummary {
     pub author_email: String,
     pub date: String,
     pub subject: String,
+    pub body: String,
     pub refs: Vec<String>,
 }
 

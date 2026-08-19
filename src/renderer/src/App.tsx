@@ -1,15 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
-import { useVirtualizer } from '@tanstack/react-virtual'
 import {
   BookOpen,
   CalendarDays,
-  Check,
   ChevronDown,
-  ChevronRight,
   Download,
-  Eye,
-  EyeOff,
-  ExternalLink,
   FolderGit2,
   FolderOpen,
   GitBranch,
@@ -17,34 +11,38 @@ import {
   LoaderCircle,
   Moon,
   Network,
-  Plus,
   RefreshCw,
   Search,
-  Server,
   Settings,
   Sun,
   Trash2,
   X
 } from 'lucide-react'
+import { FileList, HistoryTable } from './components/HistoryViews'
+import {
+  AboutDialog,
+  GettingStartedDialog,
+  SettingsDialog,
+  SshMappingsDialog,
+  type GettingStartedMode
+} from './components/AppDialogs'
+import {
+  fileChangesPageSize,
+  initialHistoryFilter,
+  useRepositoryHistory
+} from './hooks/useRepositoryHistory'
+import { useSshMappings } from './hooks/useSshMappings'
 import type {
-  CommitDetails,
-  CommitSummary,
   ExternalDiffSettings,
   FileChange,
-  FileChangesStatus,
   HistoryFilter,
   RecentRepository,
   RepositoryInfo,
   RepositoryOpenRequest,
   SearchScope,
-  SshRepositoryMapping
 } from '../../shared/types'
 
 type Theme = 'light' | 'dark'
-type GettingStartedMode = 'startup' | 'help' | null
-type Notice = { tone: 'error' | 'success'; message: string }
-
-const gitForWindowsInstallUrl = 'https://git-scm.com/install/windows'
 
 type PathsResizeState = {
   pointerId: number
@@ -56,17 +54,6 @@ type PathsResizeState = {
 const minimumPathsPanelHeight = 160
 const minimumHistoryHeight = 230
 const applicationChromeHeight = 104
-const historyPageSize = 200
-const fileChangesPageSize = 200
-const maxCachedFileChangePages = 5
-
-const initialFilter: HistoryFilter = {
-  query: '',
-  scope: 'all',
-  from: '',
-  to: '',
-  limit: historyPageSize
-}
 
 const searchScopes: Array<{ value: SearchScope; label: string }> = [
   { value: 'all', label: '全部字段' },
@@ -75,15 +62,6 @@ const searchScopes: Array<{ value: SearchScope; label: string }> = [
   { value: 'path', label: '文件路径' },
   { value: 'hash', label: 'Hash' }
 ]
-
-function emptySshRepositoryMapping(): SshRepositoryMapping {
-  return {
-    id: crypto.randomUUID(),
-    host: '',
-    port: 22,
-    username: ''
-  }
-}
 
 function repositoryDisplayPath(repository: RepositoryInfo): string {
   const rootPath = repository.displayPath ?? repository.path
@@ -94,14 +72,6 @@ function repositoryDisplayPath(repository: RepositoryInfo): string {
 
 function repositoryReferenceKey(repository: RepositoryOpenRequest): string {
   return `${repository.path}\u0000${repository.pathScope ?? ''}`
-}
-
-function sshMappingSummary(mapping: SshRepositoryMapping): string {
-  return `${mapping.host}:${mapping.port}`
-}
-
-function sshMappingLabel(mapping: SshRepositoryMapping): string {
-  return `${mapping.username}@${mapping.host}`
 }
 
 function formatDate(value: string): string {
@@ -131,190 +101,14 @@ function externalDiffArgumentsTemplate(command: string): string {
   return '"{left}" "{right}"'
 }
 
-function changeStatusLabel(status: FileChange['status']): string {
-  const labels: Record<FileChange['status'], string> = {
-    A: '新增',
-    M: '修改',
-    D: '删除',
-    R: '重命名',
-    C: '复制',
-    T: '类型变更',
-    U: '未合并',
-    X: '未知'
-  }
-  return labels[status]
-}
-
-function isAbortError(error: unknown): boolean {
-  return error instanceof Error && (
-    error.name === 'AbortError' ||
-    error.message.includes('AbortError') ||
-    error.message.includes('Git 读取已取消')
-  )
-}
-
-function HistoryTable({
-  commits,
-  selectedHash,
-  onSelect
-}: {
-  commits: CommitSummary[]
-  selectedHash: string | null
-  onSelect: (hash: string) => void
-}): React.JSX.Element {
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const virtualizer = useVirtualizer({
-    count: commits.length,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => 38,
-    overscan: 14
-  })
-  const rows = virtualizer.getVirtualItems()
-
-  return (
-    <section className="log-section" aria-label="提交历史">
-      <div className="table-header" role="row">
-        <span>图</span>
-        <span>Revision</span>
-        <span>变更</span>
-        <span>Author</span>
-        <span>Date</span>
-        <span>Message</span>
-      </div>
-      <div ref={scrollRef} className="log-table-scroll" role="grid" aria-label="Git 提交历史">
-        {commits.length === 0 ? (
-          <div className="empty-table">没有符合当前筛选条件的提交。</div>
-        ) : (
-          <div className="virtual-table" style={{ height: virtualizer.getTotalSize() }}>
-            {rows.map((row) => {
-              const commit = commits[row.index]
-              const selected = selectedHash === commit.hash
-              return (
-                <button
-                  key={commit.hash}
-                  className={`log-row ${selected ? 'is-selected' : ''}`}
-                  style={{ transform: `translateY(${row.start}px)` }}
-                  type="button"
-                  role="row"
-                  onClick={() => onSelect(commit.hash)}
-                  title="单击查看变更路径"
-                >
-                  <span className="commit-graph" aria-hidden="true"><i /><b /></span>
-                  <span className="hash-cell"><code>{commit.shortHash}</code></span>
-                  <span className="actions-cell">{commit.parents.length > 1 ? '合并' : '提交'}</span>
-                  <span className="author-cell">{commit.authorName}</span>
-                  <span className="date-cell">{formatDate(commit.date)}</span>
-                  <span className="message-cell">
-                    <strong>{commit.subject || '(无提交说明)'}</strong>
-                    {commit.refs.length > 0 && (
-                      <small>{commit.refs.slice(0, 2).join('  ')}</small>
-                    )}
-                  </span>
-                </button>
-              )
-            })}
-          </div>
-        )}
-      </div>
-    </section>
-  )
-}
-
-function FileList({
-  pages,
-  total,
-  loading,
-  selectedFile,
-  onSelect,
-  onCompare,
-  onRequestPage
-}: {
-  pages: Map<number, FileChange[]>
-  total: number
-  loading: boolean
-  selectedFile: FileChange | null
-  onSelect: (file: FileChange) => void
-  onCompare: (file: FileChange) => void
-  onRequestPage: (page: number) => void
-}): React.JSX.Element {
-  const scrollRef = useRef<HTMLDivElement>(null)
-  const virtualizer = useVirtualizer({
-    count: total,
-    getScrollElement: () => scrollRef.current,
-    estimateSize: () => 34,
-    overscan: 10
-  })
-  const rows = virtualizer.getVirtualItems()
-  const visiblePageKey = [...new Set(rows.map((row) => Math.floor(row.index / fileChangesPageSize)))].join(',')
-
-  useEffect(() => {
-    if (!visiblePageKey) return
-    visiblePageKey.split(',').forEach((value) => onRequestPage(Number(value)))
-  }, [onRequestPage, visiblePageKey])
-
-  return (
-    <div ref={scrollRef} className="file-list" role="list" aria-label="变更路径">
-      {total === 0 ? (
-        loading ? (
-          <div className="file-list-loading" role="status"><LoaderCircle className="spin" size={18} />正在读取变更文件...</div>
-        ) : (
-          <div className="empty-files">该提交没有文件变更。</div>
-        )
-      ) : (
-        <div className="file-virtual-list" style={{ height: virtualizer.getTotalSize() }}>
-          {rows.map((row) => {
-            const page = Math.floor(row.index / fileChangesPageSize)
-            const file = pages.get(page)?.[row.index % fileChangesPageSize]
-            if (!file) return null
-            return (
-              <button
-                key={`${file.status}-${file.path}-${file.previousPath ?? ''}`}
-                type="button"
-                role="listitem"
-                className={`file-row ${selectedFile?.path === file.path ? 'is-active' : ''}`}
-                style={{ transform: `translateY(${row.start}px)` }}
-                onClick={() => onSelect(file)}
-                onDoubleClick={() => onCompare(file)}
-                title={`${file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}，双击在外部工具中对比`}
-              >
-                <span className="file-path">{file.path}</span>
-                <span className={`file-action status-${file.status}`}>
-                  <span className={`change-badge status-${file.status}`}>{file.status}</span>
-                  {changeStatusLabel(file.status)}
-                </span>
-                <ChevronRight size={14} aria-hidden="true" />
-              </button>
-            )
-          })}
-        </div>
-      )}
-    </div>
-  )
-}
-
 function App(): React.JSX.Element {
   const appShellRef = useRef<HTMLElement>(null)
   const helpMenuRef = useRef<HTMLDivElement>(null)
   const pathsResizeRef = useRef<PathsResizeState | null>(null)
-  const historyRequestRef = useRef(0)
-  const historyOffsetRef = useRef(0)
   const repositoryOpenRequestRef = useRef(0)
-  const commitsRef = useRef<CommitSummary[]>([])
-  const filePageRequestsRef = useRef(new Set<string>())
-  const filePageGenerationRef = useRef(0)
   const [repository, setRepository] = useState<RepositoryInfo | null>(null)
   const [recentRepositories, setRecentRepositories] = useState<RecentRepository[]>([])
-  const [filter, setFilter] = useState<HistoryFilter>(initialFilter)
-  const [commits, setCommits] = useState<CommitSummary[]>([])
-  const [selectedHash, setSelectedHash] = useState<string | null>(null)
-  const [details, setDetails] = useState<CommitDetails | null>(null)
-  const [fileChangesStatus, setFileChangesStatus] = useState<FileChangesStatus | null>(null)
-  const [filePages, setFilePages] = useState<Map<number, FileChange[]>>(() => new Map())
-  const [selectedFile, setSelectedFile] = useState<FileChange | null>(null)
   const [theme, setTheme] = useState<Theme>(() => (localStorage.getItem('theme') as Theme) || 'light')
-  const [loadingHistory, setLoadingHistory] = useState(false)
-  const [historyHasMore, setHistoryHasMore] = useState(false)
-  const [loadingDetails, setLoadingDetails] = useState(false)
   const [openingRepository, setOpeningRepository] = useState(false)
   const [busyMessage, setBusyMessage] = useState('')
   const [error, setError] = useState('')
@@ -325,14 +119,6 @@ function App(): React.JSX.Element {
   const [cloneDestination, setCloneDestination] = useState('')
   const [settingsOpen, setSettingsOpen] = useState(false)
   const [helpMenuOpen, setHelpMenuOpen] = useState(false)
-  const [sshMappingsOpen, setSshMappingsOpen] = useState(false)
-  const [sshMappings, setSshMappings] = useState<SshRepositoryMapping[]>([])
-  const [sshMappingDraft, setSshMappingDraft] = useState<SshRepositoryMapping | null>(null)
-  const [sshMappingPassword, setSshMappingPassword] = useState('')
-  const [showSshMappingPassword, setShowSshMappingPassword] = useState(false)
-  const [sshMappingNotice, setSshMappingNotice] = useState<Notice | null>(null)
-  const [testingSshMapping, setTestingSshMapping] = useState(false)
-  const [savingSshMapping, setSavingSshMapping] = useState(false)
   const [aboutOpen, setAboutOpen] = useState(false)
   const [gettingStartedMode, setGettingStartedMode] = useState<GettingStartedMode>(() => (
     localStorage.getItem('getting-started-dismissed') === 'true' ? null : 'startup'
@@ -344,15 +130,30 @@ function App(): React.JSX.Element {
   })
   const [settingsNotice, setSettingsNotice] = useState('')
   const [pathsPanelHeight, setPathsPanelHeight] = useState<number | null>(null)
+  const {
+    filter,
+    setFilter,
+    commits,
+    selectedHash,
+    setSelectedHash,
+    details,
+    fileChangesStatus,
+    filePages,
+    selectedFile,
+    setSelectedFile,
+    loadingHistory,
+    historyHasMore,
+    loadingDetails,
+    loadHistory,
+    requestFileChangesPage,
+    reset: resetRepositoryHistory
+  } = useRepositoryHistory(repository, setError)
+  const sshMappings = useSshMappings(setError)
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme
     localStorage.setItem('theme', theme)
   }, [theme])
-
-  useEffect(() => {
-    commitsRef.current = commits
-  }, [commits])
 
   useEffect(() => {
     let cancelled = false
@@ -398,189 +199,16 @@ function App(): React.JSX.Element {
     return () => window.removeEventListener('resize', clampForWindowResize)
   }, [])
 
-  const loadHistory = useCallback(async (append = false) => {
-    if (!repository) return
-    const requestId = ++historyRequestRef.current
-    const previous = append ? commitsRef.current : []
-    const offset = append ? historyOffsetRef.current : 0
-    setLoadingHistory(true)
-    setError('')
-    try {
-      const result = await window.gitHistory.loadHistory(
-        repository.path,
-        repository.pathScope,
-        repository.pathScopeKind,
-        filter,
-        offset
-      )
-      if (requestId !== historyRequestRef.current) return
-      const next = result.commits
-      const knownHashes = new Set(previous.map((commit) => commit.hash))
-      const combined = append ? [...previous, ...next.filter((commit) => !knownHashes.has(commit.hash))] : next
-      setCommits(combined)
-      historyOffsetRef.current = result.nextOffset
-      setHistoryHasMore(result.hasMore)
-      setSelectedHash((current) => (current && combined.some((item) => item.hash === current) ? current : (combined[0]?.hash ?? null)))
-    } catch (loadError) {
-      if (requestId !== historyRequestRef.current || (loadError instanceof Error && loadError.name === 'AbortError')) return
-      setError(loadError instanceof Error ? loadError.message : '无法读取提交历史。')
-      if (!append) {
-        setCommits([])
-        setSelectedHash(null)
-        historyOffsetRef.current = 0
-      }
-      setHistoryHasMore(false)
-    } finally {
-      if (requestId === historyRequestRef.current) setLoadingHistory(false)
-    }
-  }, [filter, repository])
-
-  useEffect(() => {
-    if (!repository) return
-    const timer = window.setTimeout(() => void loadHistory(false), filter.query ? 320 : 0)
-    return () => window.clearTimeout(timer)
-  }, [filter, loadHistory, repository])
-
-  useEffect(() => {
-    filePageGenerationRef.current += 1
-    filePageRequestsRef.current.clear()
-    setFilePages(new Map())
-    if (!repository || !selectedHash) {
-      setDetails(null)
-      setFileChangesStatus(null)
-      setSelectedFile(null)
-      return
-    }
-    let cancelled = false
-    setDetails(null)
-    setFileChangesStatus(null)
-    setSelectedFile(null)
-    setLoadingDetails(true)
-    void window.gitHistory
-      .getCommitDetails(repository.path, selectedHash)
-      .then((next) => {
-        if (cancelled) return
-        setDetails(next)
-        void window.gitHistory
-          .startFileChangesScan(repository.path, repository.pathScope, next.hash)
-          .then((status) => {
-            if (!cancelled) setFileChangesStatus(status)
-          })
-          .catch((scanError) => {
-            if (!cancelled && !isAbortError(scanError)) {
-              setError(scanError instanceof Error ? scanError.message : '无法读取变更路径。')
-            }
-          })
-      })
-      .catch((detailsError) => {
-        if (!cancelled && !isAbortError(detailsError)) {
-          setError(detailsError instanceof Error ? detailsError.message : '无法读取提交详情。')
-        }
-      })
-      .finally(() => {
-        if (!cancelled) setLoadingDetails(false)
-      })
-    return () => {
-      cancelled = true
-    }
-  }, [repository, selectedHash])
-
-  useEffect(() => {
-    if (!repository || !details || fileChangesStatus?.complete) return
-    let cancelled = false
-    let timer: number | undefined
-
-    const pollStatus = async (): Promise<void> => {
-      try {
-        const next = await window.gitHistory.getFileChangesStatus(repository.path, repository.pathScope, details.hash)
-        if (cancelled) return
-        setFileChangesStatus(next)
-        if (!next.complete) timer = window.setTimeout(() => void pollStatus(), 250)
-      } catch (statusError) {
-        if (!cancelled && !isAbortError(statusError)) {
-          setError(statusError instanceof Error ? statusError.message : '无法读取变更路径。')
-        }
-      }
-    }
-
-    void pollStatus()
-    return () => {
-      cancelled = true
-      if (timer !== undefined) window.clearTimeout(timer)
-    }
-  }, [details, fileChangesStatus?.complete, repository])
-
-  const requestFileChangesPage = useCallback((page: number): void => {
-    if (!repository || !details) return
-    const generation = filePageGenerationRef.current
-    const requestKey = `${generation}:${page}`
-    if (filePageRequestsRef.current.has(requestKey)) return
-    filePageRequestsRef.current.add(requestKey)
-
-    void window.gitHistory
-      .getFileChangesPage(repository.path, repository.pathScope, details.hash, page)
-        .then((result) => {
-          if (generation !== filePageGenerationRef.current) return
-          setFileChangesStatus({
-            scannedCount: result.scannedCount,
-            availableCount: result.availableCount,
-            complete: result.complete
-          })
-          setFilePages((current) => {
-          const next = new Map(current)
-          next.delete(result.page)
-          next.set(result.page, result.changes)
-          while (next.size > maxCachedFileChangePages) {
-            const oldest = next.keys().next().value
-            if (oldest === undefined) break
-            next.delete(oldest)
-          }
-          return next
-        })
-        setSelectedFile((current) => current ?? result.changes[0] ?? null)
-      })
-      .catch((pageError) => {
-        if (generation === filePageGenerationRef.current) {
-          setError(pageError instanceof Error ? pageError.message : '无法读取变更路径。')
-        }
-      })
-      .finally(() => filePageRequestsRef.current.delete(requestKey))
-  }, [details, repository])
-
   const selectRepository = useCallback((repo: RepositoryInfo): void => {
-    historyRequestRef.current += 1
-    historyOffsetRef.current = 0
-    filePageGenerationRef.current += 1
-    filePageRequestsRef.current.clear()
-    setCommits([])
-    setHistoryHasMore(false)
-    setSelectedHash(null)
-    setDetails(null)
-    setFileChangesStatus(null)
-    setFilePages(new Map())
-    setSelectedFile(null)
-    setLoadingHistory(false)
+    resetRepositoryHistory()
     setRepository(repo)
-    setFilter(initialFilter)
     void window.gitHistory.addRecentRepository(repo).then(setRecentRepositories).catch((saveError) => {
       setError(saveError instanceof Error ? saveError.message : '无法保存最近打开的项目。')
     })
-  }, [])
+  }, [resetRepositoryHistory])
 
   const closeRepository = (): void => {
-    historyRequestRef.current += 1
-    historyOffsetRef.current = 0
-    filePageGenerationRef.current += 1
-    filePageRequestsRef.current.clear()
-    setCommits([])
-    setHistoryHasMore(false)
-    setSelectedHash(null)
-    setDetails(null)
-    setFileChangesStatus(null)
-    setFilePages(new Map())
-    setSelectedFile(null)
-    setLoadingHistory(false)
-    setLoadingDetails(false)
+    resetRepositoryHistory()
     setError('')
     setRepository(null)
     void window.gitHistory.cancelHistoryRequests()
@@ -723,111 +351,12 @@ function App(): React.JSX.Element {
     }
   }
 
-  const clearFilter = (): void => setFilter(initialFilter)
+  const clearFilter = (): void => setFilter(initialHistoryFilter)
 
   const openSettings = async (): Promise<void> => {
     setExternalSettings(await window.gitHistory.getExternalDiffSettings())
     setSettingsNotice('')
     setSettingsOpen(true)
-  }
-
-  const openSshMappings = async (): Promise<void> => {
-    try {
-      setSshMappings(await window.gitHistory.listSshRepositoryMappings())
-      setSshMappingDraft(null)
-      setSshMappingPassword('')
-      setShowSshMappingPassword(false)
-      setSshMappingNotice(null)
-      setSavingSshMapping(false)
-      setSshMappingsOpen(true)
-    } catch (mappingError) {
-      setError(mappingError instanceof Error ? mappingError.message : '无法读取 SSH 服务器配置。')
-    }
-  }
-
-  const validateSshMappingDraft = (): SshRepositoryMapping | null => {
-    if (!sshMappingDraft) return null
-    const mapping: SshRepositoryMapping = {
-      id: sshMappingDraft.id || crypto.randomUUID(),
-      host: sshMappingDraft.host.trim(),
-      port: Math.floor(Number(sshMappingDraft.port)),
-      username: sshMappingDraft.username.trim(),
-      hasStoredPassword: sshMappingDraft.hasStoredPassword
-    }
-    if (!mapping.host || !mapping.username) {
-      setSshMappingNotice({ tone: 'error', message: '请填写服务器主机和 SSH 用户名。' })
-      return null
-    }
-    if (!Number.isInteger(mapping.port) || mapping.port < 1 || mapping.port > 65535) {
-      setSshMappingNotice({ tone: 'error', message: 'SSH 端口必须在 1 到 65535 之间。' })
-      return null
-    }
-    const existing = sshMappings.find((item) => item.id === mapping.id)
-    if (!sshMappingPassword && !existing?.hasStoredPassword) {
-      setSshMappingNotice({ tone: 'error', message: '请输入 SSH 密码。密码会使用 Windows 凭据加密保存。' })
-      return null
-    }
-    const normalizedHost = mapping.host.replace(/^\[|\]$/g, '').toLocaleLowerCase()
-    const duplicate = sshMappings.some((item) => item.id !== mapping.id &&
-      item.host.replace(/^\[|\]$/g, '').toLocaleLowerCase() === normalizedHost)
-    if (duplicate) {
-      setSshMappingNotice({ tone: 'error', message: '该服务器地址已经配置。请编辑已有服务器。' })
-      return null
-    }
-    return mapping
-  }
-
-  const saveSshMapping = async (): Promise<void> => {
-    const mapping = validateSshMappingDraft()
-    if (!mapping) return
-    setSavingSshMapping(true)
-    setSshMappingNotice(null)
-    try {
-      const next = sshMappings.some((item) => item.id === mapping.id)
-        ? sshMappings.map((item) => (item.id === mapping.id ? mapping : item))
-        : [...sshMappings, mapping]
-      const savedMappings = await window.gitHistory.saveSshRepositoryMappings(next)
-      if (sshMappingPassword) {
-        await window.gitHistory.setSshRepositoryPassword(mapping.id, sshMappingPassword)
-      }
-      setSshMappings(savedMappings.map((item) => item.id === mapping.id
-        ? { ...item, hasStoredPassword: item.hasStoredPassword || Boolean(sshMappingPassword) }
-        : item))
-      setSshMappingDraft(null)
-      setSshMappingPassword('')
-      setShowSshMappingPassword(false)
-      setSshMappingNotice({ tone: 'success', message: 'SSH 服务器已保存。' })
-    } catch (mappingError) {
-      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法保存 SSH 服务器。' })
-    } finally {
-      setSavingSshMapping(false)
-    }
-  }
-
-  const testSshMapping = async (): Promise<void> => {
-    const mapping = validateSshMappingDraft()
-    if (!mapping) return
-    setTestingSshMapping(true)
-    setSshMappingNotice(null)
-    try {
-      await window.gitHistory.testSshRepositoryMapping(mapping, sshMappingPassword || undefined)
-      setSshMappingNotice({ tone: 'success', message: 'SSH 连接成功，服务器可以执行 Git。' })
-    } catch (mappingError) {
-      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : 'SSH 连接测试失败。' })
-    } finally {
-      setTestingSshMapping(false)
-    }
-  }
-
-  const removeSshMapping = async (mapping: SshRepositoryMapping): Promise<void> => {
-    if (!window.confirm(`移除 SSH 服务器 ${sshMappingLabel(mapping)}？`)) return
-    try {
-      const next = await window.gitHistory.saveSshRepositoryMappings(sshMappings.filter((item) => item.id !== mapping.id))
-      setSshMappings(next)
-      setSshMappingNotice({ tone: 'success', message: 'SSH 服务器已移除。' })
-    } catch (mappingError) {
-      setSshMappingNotice({ tone: 'error', message: mappingError instanceof Error ? mappingError.message : '无法移除 SSH 服务器。' })
-    }
   }
 
   const closeGettingStarted = (): void => {
@@ -890,149 +419,54 @@ function App(): React.JSX.Element {
   const appShellStyle = pathsPanelHeight === null
     ? undefined
     : ({ '--paths-panel-height': `${pathsPanelHeight}px` } as React.CSSProperties)
-  const settingsDialog = settingsOpen ? (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal settings-modal" role="dialog" aria-modal="true" aria-labelledby="settings-title">
-        <div className="modal-heading"><div><h2 id="settings-title">外部对比工具</h2></div><button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setSettingsOpen(false)}><X size={18} /></button></div>
-        <label>程序路径<div className="path-picker"><input value={externalSettings.command} onChange={(event) => { const command = event.target.value; setExternalSettings({ command, argumentsTemplate: externalDiffArgumentsTemplate(command) }) }} placeholder="C:\\Program Files\\WinMerge\\WinMergeU.exe" autoFocus /><button className="secondary-button compact" type="button" onClick={() => void chooseExternalDiffTool()}>浏览</button></div></label>
-        {settingsNotice && <div className="inline-error" role="alert">{settingsNotice}</div>}
-        <div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setSettingsOpen(false)}>取消</button><button className="primary-button" type="button" onClick={() => void saveSettings()}><Check size={17} />保存</button></div>
-      </section>
-    </div>
-  ) : null
-  const sshMappingsDialog = sshMappingsOpen ? (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal ssh-mappings-modal" role="dialog" aria-modal="true" aria-labelledby="ssh-mappings-title">
-        <div className="modal-heading">
-          <div><h2 id="ssh-mappings-title">SSH 服务器</h2><p>管理网络盘仓库使用的服务器账号。</p></div>
-          <button className="icon-button" type="button" aria-label="关闭" title="关闭" disabled={testingSshMapping || savingSshMapping} onClick={() => setSshMappingsOpen(false)}><X size={18} /></button>
-        </div>
-        {sshMappingDraft ? (
-          <form className="ssh-mapping-form" onSubmit={(event) => { event.preventDefault(); void saveSshMapping() }}>
-            <div className="ssh-mapping-grid">
-              <div className="ssh-server-address-row wide">
-                <label><span>服务器地址 <b aria-hidden="true">*</b></span><input value={sshMappingDraft.host} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, host: event.target.value })} placeholder="192.168.160.76" autoComplete="off" required autoFocus /></label>
-                <label><span>端口 <b aria-hidden="true">*</b></span><input type="number" min="1" max="65535" value={sshMappingDraft.port} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, port: Number(event.target.value) })} required /></label>
-              </div>
-              <label className="wide"><span>用户名 <b aria-hidden="true">*</b></span><input value={sshMappingDraft.username} onChange={(event) => setSshMappingDraft({ ...sshMappingDraft, username: event.target.value })} placeholder="用户名" autoComplete="username" required /></label>
-              <label className="wide"><span>密码 <b aria-hidden="true">*</b></span><div className="password-input"><input type={showSshMappingPassword ? 'text' : 'password'} value={sshMappingPassword} onChange={(event) => setSshMappingPassword(event.target.value)} placeholder={sshMappingDraft.hasStoredPassword ? '留空则保持现有密码' : '输入 SSH 密码'} autoComplete="current-password" required={!sshMappingDraft.hasStoredPassword} /><button className="icon-button password-visibility-button" type="button" aria-label={showSshMappingPassword ? '隐藏 SSH 密码' : '显示 SSH 密码'} title={showSshMappingPassword ? '隐藏密码' : '显示密码'} onClick={() => setShowSshMappingPassword(!showSshMappingPassword)}>{showSshMappingPassword ? <EyeOff size={17} /> : <Eye size={17} />}</button></div></label>
-            </div>
-            {sshMappingNotice && <div className={`ssh-mapping-notice ${sshMappingNotice.tone}`} role={sshMappingNotice.tone === 'error' ? 'alert' : 'status'}>{sshMappingNotice.message}</div>}
-            <div className="modal-actions">
-              <button className="secondary-button" type="button" disabled={testingSshMapping || savingSshMapping} onClick={() => void testSshMapping()}>{testingSshMapping ? <LoaderCircle className="spin" size={17} /> : <Network size={17} />}测试连接</button>
-              <button className="primary-button" type="submit" disabled={testingSshMapping || savingSshMapping}>{savingSshMapping ? <LoaderCircle className="spin" size={17} /> : <Check size={17} />}{savingSshMapping ? '正在保存' : '保存服务器'}</button>
-            </div>
-          </form>
-        ) : (
-          <>
-            <div className="ssh-mapping-list" role="list" aria-label="SSH 服务器列表">
-              {sshMappings.length === 0 ? (
-                <div className="ssh-mapping-empty"><Server size={20} aria-hidden="true" /><span>尚未添加 SSH 服务器</span></div>
-              ) : sshMappings.map((mapping) => (
-                <div className="ssh-mapping-row" role="listitem" key={mapping.id}>
-                  <div className="ssh-mapping-summary"><strong>{sshMappingLabel(mapping)}</strong><span title={sshMappingSummary(mapping)}>{sshMappingSummary(mapping)}</span><small className={mapping.hasStoredPassword ? '' : 'needs-password'}>{mapping.hasStoredPassword ? '密码已安全保存' : '需要设置密码'}</small></div>
-                  <div className="ssh-mapping-row-actions"><button className="secondary-button compact" type="button" onClick={() => { setSshMappingDraft({ ...mapping }); setSshMappingPassword(''); setShowSshMappingPassword(false); setSshMappingNotice(null) }}>编辑</button><button className="icon-button" type="button" aria-label={`移除 SSH 服务器 ${sshMappingLabel(mapping)}`} title="移除服务器" onClick={() => void removeSshMapping(mapping)}><Trash2 size={17} /></button></div>
-                </div>
-              ))}
-            </div>
-            {sshMappingNotice && <div className={`ssh-mapping-notice ${sshMappingNotice.tone}`} role={sshMappingNotice.tone === 'error' ? 'alert' : 'status'}>{sshMappingNotice.message}</div>}
-            <div className="modal-actions"><button className="secondary-button" type="button" onClick={() => setSshMappingsOpen(false)}>关闭</button><button className="primary-button" type="button" onClick={() => { setSshMappingDraft(emptySshRepositoryMapping()); setSshMappingPassword(''); setShowSshMappingPassword(false); setSshMappingNotice(null) }}><Plus size={17} />添加服务器</button></div>
-          </>
-        )}
-      </section>
-    </div>
-  ) : null
-  const aboutDialog = aboutOpen ? (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal about-modal" role="dialog" aria-modal="true" aria-labelledby="about-title">
-        <header className="about-header">
-          <div className="about-brand">
-            <div className="about-mark" aria-hidden="true"><GitBranch size={22} /></div>
-            <div>
-              <h2 id="about-title">Git History Viewer</h2>
-              <p>关于</p>
-            </div>
-          </div>
-          <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={() => setAboutOpen(false)}><X size={18} /></button>
-        </header>
-        <dl className="about-details">
-          <div><dt>版本</dt><dd><code>{__APP_VERSION__}</code></dd></div>
-          <div><dt>作者</dt><dd>sunjx</dd></div>
-        </dl>
-        <div className="about-actions"><button className="secondary-button" type="button" onClick={() => setAboutOpen(false)}>关闭</button></div>
-      </section>
-    </div>
-  ) : null
-  const gettingStartedDialog = gettingStartedMode ? (
-    <div className="modal-backdrop" role="presentation">
-      <section className="modal getting-started-modal" role="dialog" aria-modal="true" aria-labelledby="getting-started-title">
-        <div className="modal-heading">
-          <div>
-            <h2 id="getting-started-title">{gettingStartedMode === 'startup' ? '欢迎使用' : '功能说明'}</h2>
-            {gettingStartedMode === 'startup' && <p>三步开始查看本地、远程或网络盘仓库历史。</p>}
-          </div>
-          <button className="icon-button" type="button" aria-label="关闭" title="关闭" onClick={closeGettingStarted}><X size={18} /></button>
-        </div>
-        {gettingStartedMode === 'startup' ? (
-          <ol className="getting-started-steps">
-            <li>
-              <div>
-                <strong>准备 Git 环境</strong>
-                <span>打开本地仓库和导入远程仓库需要 Git for Windows。</span>
-                <a href={gitForWindowsInstallUrl} className="instruction-link" onClick={(event) => { event.preventDefault(); void window.gitHistory.openGitForWindowsDownload() }}>
-                  <span>{gitForWindowsInstallUrl}</span><ExternalLink size={14} aria-hidden="true" />
-                </a>
-              </div>
-            </li>
-            <li>
-              <div>
-                <strong>选择仓库入口</strong>
-                <span>打开本地目录、导入远程仓库，或在资源管理器中右键目录、目录空白处或文件。</span>
-                <div className="getting-started-actions">
-                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openLocalRepository() }}><FolderOpen size={15} />打开本地仓库</button>
-                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); setRemoteOpen(true) }}><Download size={15} />导入远程仓库</button>
-                </div>
-              </div>
-            </li>
-            <li>
-              <div>
-                <strong>按需配置工具</strong>
-                <span>网络盘仓库使用 SSH 密码服务器；双击变更文件前需配置外部对比工具。</span>
-                <div className="getting-started-actions">
-                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />SSH 服务器</button>
-                  <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSettings() }}><Settings size={15} />外部对比工具</button>
-                </div>
-              </div>
-            </li>
-          </ol>
-        ) : (
-          <ol className="getting-started-steps">
-            <li><div><strong>打开仓库</strong><span>支持本地目录、最近打开和远程仓库导入。可在资源管理器中右键目录、目录空白处或单个文件，直接查看对应范围的历史。</span></div></li>
-            <li>
-              <div>
-                <strong>访问网络盘仓库</strong>
-                <span>添加与网络盘主机对应的 SSH 服务器，填写地址、端口、用户名和密码。密码由当前 Windows 帐户加密保存，Git 命令在服务器执行。</span>
-                <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSshMappings() }}><Network size={15} />管理 SSH 服务器</button>
-              </div>
-            </li>
-            <li>
-              <div>
-                <strong>对比文件</strong>
-                <span>配置外部对比工具后，双击变更路径即可查看提交前后的文件差异。</span>
-                <button className="quiet-button getting-started-action" type="button" onClick={() => { closeGettingStarted(); void openSettings() }}><Settings size={15} />配置外部对比工具</button>
-              </div>
-            </li>
-          </ol>
-        )}
-        <div className={`getting-started-footer ${gettingStartedMode === 'startup' ? 'has-dismissal' : ''}`}>
-          {gettingStartedMode === 'startup' && (
-            <label className="check-row"><input type="checkbox" checked={dismissGettingStarted} onChange={(event) => updateGettingStartedDismissal(event.target.checked)} />启动时不再显示</label>
-          )}
-          <button className="primary-button" type="button" autoFocus onClick={closeGettingStarted}>{gettingStartedMode === 'startup' ? '开始使用' : '关闭'}</button>
-        </div>
-      </section>
-    </div>
-  ) : null
+  const settingsDialog = (
+    <SettingsDialog
+      open={settingsOpen}
+      settings={externalSettings}
+      notice={settingsNotice}
+      onSettingsChange={(settings) => setExternalSettings({
+        ...settings,
+        argumentsTemplate: externalDiffArgumentsTemplate(settings.command)
+      })}
+      onBrowse={() => void chooseExternalDiffTool()}
+      onSave={() => void saveSettings()}
+      onClose={() => setSettingsOpen(false)}
+    />
+  )
+  const sshMappingsDialog = (
+    <SshMappingsDialog
+      open={sshMappings.open}
+      mappings={sshMappings.mappings}
+      draft={sshMappings.draft}
+      password={sshMappings.password}
+      showPassword={sshMappings.showPassword}
+      notice={sshMappings.notice}
+      testing={sshMappings.testing}
+      saving={sshMappings.saving}
+      onDraftChange={sshMappings.setDraft}
+      onPasswordChange={sshMappings.setPassword}
+      onTogglePassword={sshMappings.togglePassword}
+      onEdit={sshMappings.edit}
+      onAdd={sshMappings.add}
+      onRemove={(mapping) => void sshMappings.remove(mapping)}
+      onTest={() => void sshMappings.test()}
+      onSave={() => void sshMappings.save()}
+      onClose={sshMappings.closeDialog}
+    />
+  )
+  const aboutDialog = <AboutDialog open={aboutOpen} onClose={() => setAboutOpen(false)} />
+  const gettingStartedDialog = (
+    <GettingStartedDialog
+      mode={gettingStartedMode}
+      dismissed={dismissGettingStarted}
+      onDismissedChange={updateGettingStartedDismissal}
+      onClose={closeGettingStarted}
+      onOpenLocal={() => { closeGettingStarted(); void openLocalRepository() }}
+      onOpenRemote={() => { closeGettingStarted(); setRemoteOpen(true) }}
+      onOpenSsh={() => { closeGettingStarted(); void sshMappings.openDialog() }}
+      onOpenSettings={() => { closeGettingStarted(); void openSettings() }}
+    />
+  )
 
   if (!repository) {
     return (
@@ -1054,7 +488,7 @@ function App(): React.JSX.Element {
             <button className="secondary-button compact" type="button" onClick={() => void openUserDataDirectory()}>
               <FolderOpen size={15} />打开数据目录
             </button>
-            <button className="secondary-button compact" type="button" onClick={() => void openSshMappings()}>
+            <button className="secondary-button compact" type="button" onClick={() => void sshMappings.openDialog()}>
               <Network size={15} />SSH 服务器
             </button>
             <button className="secondary-button compact" type="button" onClick={() => void openSettings()}>
@@ -1192,6 +626,7 @@ function App(): React.JSX.Element {
         commits={commits}
         selectedHash={selectedHash}
         onSelect={setSelectedHash}
+        formatDate={formatDate}
       />
 
       <section className="bottom-panel" aria-label="变更路径">
@@ -1229,6 +664,7 @@ function App(): React.JSX.Element {
               total={visibleFileCount}
               loading={fileChangesLoading}
               selectedFile={selectedFile}
+              pageSize={fileChangesPageSize}
               onSelect={setSelectedFile}
               onCompare={(file) => void openExternalComparison(file)}
               onRequestPage={requestFileChangesPage}

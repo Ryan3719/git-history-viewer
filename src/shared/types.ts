@@ -38,6 +38,7 @@ export interface CommitSummary {
   authorEmail: string
   date: string
   subject: string
+  body: string
   refs: string[]
 }
 

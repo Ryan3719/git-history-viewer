@@ -237,9 +237,9 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .table-header, .log-row {
   display: grid;
-  grid-template-columns: 40px 104px 84px 142px 150px minmax(320px, 1fr);
+  grid-template-columns: 40px 104px 142px 150px minmax(320px, 1fr) minmax(180px, 0.55fr);
   align-items: center;
-  min-width: 870px;
+  min-width: 936px;
 }
 
 .table-header {
@@ -256,7 +256,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .log-table-scroll { position: relative; min-height: 0; overflow: auto; background: var(--surface); }
 
-.virtual-table { position: relative; min-width: 870px; }
+.virtual-table { position: relative; min-width: 936px; }
 
 .log-row {
   position: absolute;
@@ -268,12 +268,21 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   border-bottom: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   background: var(--surface);
   color: var(--text);
+  cursor: pointer;
   text-align: left;
 }
 
 .log-row:hover { background: var(--surface-hover); }
 
 .log-row.is-selected { background: var(--focus-soft); box-shadow: inset 3px 0 0 var(--focus); }
+
+.log-row:focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: -1px;
+  z-index: 1;
+}
+
+.log-row.is-expanded { height: auto; min-height: 70px; align-items: start; padding-block: 7px; }
 
 .commit-graph { position: relative; display: grid; height: 100%; place-items: center; }
 
@@ -285,15 +294,55 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .hash-cell code { color: var(--accent); font-weight: 650; }
 
-.actions-cell, .author-cell, .date-cell { overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
+.author-cell, .date-cell, .refs-cell { overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
 
 .date-cell { font-variant-numeric: tabular-nums; }
 
-.message-cell { display: flex; min-width: 0; align-items: baseline; gap: 10px; overflow: hidden; }
+.refs-cell { color: var(--text-faint); }
 
-.message-cell strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+.message-cell {
+  display: grid;
+  min-width: 0;
+  grid-template-columns: 26px minmax(0, 1fr);
+  align-items: center;
+  column-gap: 4px;
+  row-gap: 4px;
+}
 
-.message-cell small { overflow: hidden; color: var(--text-faint); text-overflow: ellipsis; white-space: nowrap; }
+.message-heading { min-width: 0; grid-column: 2; }
+
+.message-heading strong {
+  display: block;
+  min-width: 0;
+  overflow: hidden;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.commit-message-toggle {
+  display: inline-grid;
+  grid-column: 1;
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  place-items: center;
+  padding: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-faint);
+  transition: background-color 160ms ease, color 160ms ease;
+}
+
+.commit-message-toggle:hover { background: var(--section-inset); color: var(--accent); }
+
+.commit-message-toggle:active { background: var(--focus-soft); }
+
+.message-body { grid-column: 2; color: var(--text-muted); line-height: 1.45; overflow-wrap: anywhere; white-space: pre-wrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  .commit-message-toggle { transition: none; }
+}
 
 .empty-table, .detail-loading, .empty-files { display: grid; min-height: 100%; place-items: center; padding: 24px; color: var(--text-muted); text-align: center; }
 

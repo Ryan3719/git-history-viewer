@@ -244,7 +244,6 @@ impl GitService {
         }
         let mut args = vec![
             "log".into(),
-            "--all".into(),
             "--date=iso-strict".into(),
             format!("--max-count={}", page_limit + 1),
             format!("--format={COMMIT_FORMAT}"),
@@ -294,7 +293,6 @@ impl GitService {
         loop {
             let mut args = vec![
                 "log".into(),
-                "--all".into(),
                 "--date=iso-strict".into(),
                 "--name-only".into(),
                 "-z".into(),
@@ -1514,5 +1512,70 @@ mod tests {
         assert_eq!(result.commits[0].subject, "commit 0");
         assert!(!result.has_more);
         assert_eq!(result.next_offset, 5);
+    }
+
+    #[test]
+    fn history_only_includes_current_head_branch() {
+        let repository = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = repository.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "History Test"]);
+        run(&["config", "user.email", "history@example.com"]);
+        fs::write(path.join("current.txt"), "current").unwrap();
+        run(&["add", "current.txt"]);
+        run(&["commit", "-q", "-m", "current-only"]);
+        run(&["checkout", "-q", "-b", "unrelated"]);
+        fs::write(path.join("unrelated.txt"), "unrelated").unwrap();
+        run(&["add", "unrelated.txt"]);
+        run(&["commit", "-q", "-m", "other-only"]);
+        run(&["checkout", "-q", "-"]);
+
+        let service = git_service(cache.path());
+        let history_filter = HistoryFilter {
+            query: String::new(),
+            scope: "all".into(),
+            from: String::new(),
+            to: String::new(),
+            limit: 20,
+        };
+        let history = service
+            .list_commits(
+                path.to_string_lossy().as_ref(),
+                None,
+                None,
+                &history_filter,
+                0,
+                service.next_history_request(),
+            )
+            .unwrap();
+        assert_eq!(history.commits.len(), 1);
+        assert_eq!(history.commits[0].subject, "current-only");
+
+        let search_filter = HistoryFilter {
+            query: "other-only".into(),
+            scope: "message".into(),
+            ..history_filter
+        };
+        let search = service
+            .list_commits(
+                path.to_string_lossy().as_ref(),
+                None,
+                None,
+                &search_filter,
+                0,
+                service.next_history_request(),
+            )
+            .unwrap();
+        assert!(search.commits.is_empty());
+        assert!(!search.has_more);
     }
 }

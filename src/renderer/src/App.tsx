@@ -599,8 +599,16 @@ function App(): React.JSX.Element {
       <section className="filter-bar" aria-label="提交筛选">
         <div className="filter-search">
           <Search size={17} aria-hidden="true" />
-          <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="搜索提交、作者、文件路径或哈希" aria-label="搜索提交、作者、文件路径或哈希" />
+          <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="搜索提交记录" aria-label="搜索提交记录" />
         </div>
+        <label className="search-scope">
+          <span>搜索字段</span>
+          <select value={filter.scope} onChange={(event) => setFilter({ ...filter, scope: event.target.value as typeof filter.scope })} aria-label="搜索字段">
+            <option value="all">全部字段</option>
+            <option value="author">Author</option>
+            <option value="message">Commit Message</option>
+          </select>
+        </label>
         <span className="date-filter"><CalendarDays size={15} aria-hidden="true" /><label>起始<input type="date" value={filter.from} onChange={(event) => setFilter({ ...filter, from: event.target.value })} /></label><label>截止<input type="date" value={filter.to} onChange={(event) => setFilter({ ...filter, to: event.target.value })} /></label></span>
         <div className="history-toolbar-actions">
           {activeFilterCount > 0 && <button className="quiet-button compact" type="button" onClick={clearFilter}><X size={15} aria-hidden="true" />清除筛选</button>}
@@ -625,6 +633,8 @@ function App(): React.JSX.Element {
         selectedHash={selectedHash}
         onSelect={setSelectedHash}
         formatDate={formatDate}
+        searchQuery={filter.query}
+        searchScope={filter.scope}
       />
 
       <section className="bottom-panel" aria-label="变更路径">
@@ -666,6 +676,7 @@ function App(): React.JSX.Element {
               onSelect={setSelectedFile}
               onCompare={(file) => void openExternalComparison(file)}
               onRequestPage={requestFileChangesPage}
+              searchQuery={filter.scope === 'all' ? filter.query : ''}
             />
           </aside>
         )}

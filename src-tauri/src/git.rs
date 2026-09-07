@@ -78,10 +78,26 @@ struct FileChangesCacheEntry {
     last_access: u64,
 }
 
-struct HistorySearchRecord {
+struct HistorySearchMetadata {
     commit: CommitSummary,
     message: String,
-    paths: Vec<String>,
+}
+
+enum HistorySearchParseState {
+    AwaitRecord,
+    Metadata,
+    Paths {
+        metadata: Box<HistorySearchMetadata>,
+        matches: bool,
+        check_paths: bool,
+    },
+}
+
+struct HistorySearchStream {
+    pending: Vec<u8>,
+    scope: String,
+    needle: String,
+    state: HistorySearchParseState,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -297,12 +313,14 @@ impl GitService {
             let mut args = vec![
                 "log".into(),
                 "--date=iso-strict".into(),
-                "--name-only".into(),
-                "-z".into(),
                 format!("--max-count={HISTORY_SEARCH_BATCH_SIZE}"),
                 format!("--skip={scan_offset}"),
                 format!("--format={}", search_commit_format()),
             ];
+            if filter.scope == "all" {
+                args.push("--name-only".into());
+                args.push("-z".into());
+            }
             append_date_filter(&mut args, filter);
             if !path_scope.is_empty() {
                 args.push("--".into());
@@ -313,28 +331,34 @@ impl GitService {
             if remaining.is_zero() {
                 return Err("Git 历史搜索超时。请缩小日期或路径范围后重试。".into());
             }
-            let output = String::from_utf8_lossy(&self.run_git(
-                Some(repository_path),
-                &args,
-                MAX_OUTPUT_BYTES,
-                || self.history_generation.load(Ordering::Acquire) != request_generation,
-                remaining,
-            )?)
-            .into_owned();
-            let records = parse_history_search_records(&output);
-            let scanned = records.len();
-            for record in records {
-                if history_record_matches(&record, &filter.scope, &needle) {
+            let mut stream = HistorySearchStream::new(&filter.scope, &needle);
+            let mut scanned = 0;
+            let mut next_offset = None;
+            let mut process_record = |commit: CommitSummary, matches: bool| {
+                if matches {
                     if commits.len() == page_limit {
-                        return Ok(HistoryPage {
-                            commits,
-                            has_more: true,
-                            next_offset: scan_offset,
-                        });
+                        next_offset.get_or_insert(scan_offset);
+                    } else {
+                        commits.push(commit);
                     }
-                    commits.push(record.commit);
                 }
                 scan_offset += 1;
+                scanned += 1;
+            };
+            self.run_git_stream_with_timeout(
+                Some(repository_path),
+                &args,
+                remaining,
+                || self.history_generation.load(Ordering::Acquire) != request_generation,
+                |chunk| stream.push(chunk, &mut process_record),
+            )?;
+            stream.finish(&mut process_record);
+            if let Some(next_offset) = next_offset {
+                return Ok(HistoryPage {
+                    commits,
+                    has_more: true,
+                    next_offset,
+                });
             }
             if scanned < HISTORY_SEARCH_BATCH_SIZE {
                 return Ok(HistoryPage {
@@ -1073,61 +1097,142 @@ fn search_commit_format() -> String {
     format!("{SEARCH_COMMIT_FORMAT_PREFIX}%<({HISTORY_COMMIT_BODY_LIMIT},trunc)%B")
 }
 
-fn parse_history_search_records(output: &str) -> Vec<HistorySearchRecord> {
-    output
-        .split(RECORD_SEPARATOR)
-        .filter_map(|record| {
-            let mut parts = record.split('\0');
-            let metadata = parts.next()?.trim_start_matches(['\r', '\n']);
-            if metadata.is_empty() {
-                return None;
+impl HistorySearchStream {
+    fn new(scope: &str, needle: &str) -> Self {
+        Self {
+            pending: Vec::new(),
+            scope: scope.to_string(),
+            needle: needle.to_string(),
+            state: HistorySearchParseState::AwaitRecord,
+        }
+    }
+
+    fn push(
+        &mut self,
+        chunk: &[u8],
+        on_record: &mut impl FnMut(CommitSummary, bool),
+    ) -> Result<(), String> {
+        for &byte in chunk {
+            if byte == RECORD_SEPARATOR as u8 {
+                self.complete_record(on_record);
+                self.state = HistorySearchParseState::Metadata;
+                continue;
             }
-            let values: Vec<_> = metadata.split(FIELD_SEPARATOR).collect();
-            let hash = values.first()?.to_string();
-            let subject = values.get(5).unwrap_or(&"").to_string();
-            let message = values.get(7).unwrap_or(&"").trim().to_string();
-            let commit = CommitSummary {
-                short_hash: hash.chars().take(8).collect(),
-                hash,
-                parents: values
-                    .get(1)
-                    .unwrap_or(&"")
-                    .split_whitespace()
-                    .map(str::to_string)
-                    .collect(),
-                author_name: values.get(2).unwrap_or(&"").to_string(),
-                author_email: values.get(3).unwrap_or(&"").to_string(),
-                date: values.get(4).unwrap_or(&"").to_string(),
-                body: message
-                    .strip_prefix(&subject)
-                    .unwrap_or(&message)
-                    .trim_matches(['\r', '\n'])
-                    .to_string(),
-                subject,
-                refs: values
-                    .get(6)
-                    .unwrap_or(&"")
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .map(str::to_string)
-                    .collect(),
-            };
-            let paths = parts
-                .map(|path| path.trim_matches(['\r', '\n']))
-                .filter(|path| !path.is_empty())
-                .map(str::to_string)
-                .collect();
-            Some(HistorySearchRecord {
-                commit,
-                message,
-                paths,
-            })
-        })
-        .collect()
+
+            match &mut self.state {
+                HistorySearchParseState::AwaitRecord => {}
+                HistorySearchParseState::Metadata if byte == b'\0' => {
+                    let metadata = std::mem::take(&mut self.pending);
+                    if let Some(metadata) = parse_history_search_metadata(&metadata) {
+                        let matches =
+                            history_metadata_matches(&metadata, &self.scope, &self.needle);
+                        self.state = HistorySearchParseState::Paths {
+                            metadata: Box::new(metadata),
+                            matches,
+                            check_paths: !matches && self.scope == "all",
+                        };
+                    } else {
+                        self.state = HistorySearchParseState::AwaitRecord;
+                    }
+                }
+                HistorySearchParseState::Paths {
+                    matches,
+                    check_paths,
+                    ..
+                } if byte == b'\0' => {
+                    if *check_paths
+                        && !*matches
+                        && history_path_matches(&self.needle, &self.pending)
+                    {
+                        *matches = true;
+                    }
+                    self.pending.clear();
+                }
+                HistorySearchParseState::Paths {
+                    matches,
+                    check_paths,
+                    ..
+                } => {
+                    if *check_paths && !*matches {
+                        self.pending.push(byte);
+                    }
+                }
+                _ => self.pending.push(byte),
+            }
+        }
+        Ok(())
+    }
+
+    fn finish(&mut self, on_record: &mut impl FnMut(CommitSummary, bool)) {
+        self.complete_record(on_record);
+    }
+
+    fn complete_record(&mut self, on_record: &mut impl FnMut(CommitSummary, bool)) {
+        let state = std::mem::replace(&mut self.state, HistorySearchParseState::AwaitRecord);
+        match state {
+            HistorySearchParseState::AwaitRecord => {}
+            HistorySearchParseState::Metadata => {
+                if let Some(metadata) = parse_history_search_metadata(&self.pending) {
+                    let matches = history_metadata_matches(&metadata, &self.scope, &self.needle);
+                    on_record(metadata.commit, matches);
+                }
+            }
+            HistorySearchParseState::Paths {
+                metadata,
+                mut matches,
+                check_paths,
+            } => {
+                if check_paths && !matches && history_path_matches(&self.needle, &self.pending) {
+                    matches = true;
+                }
+                on_record(metadata.commit, matches);
+            }
+        }
+        self.pending.clear();
+    }
 }
 
-fn history_record_matches(record: &HistorySearchRecord, scope: &str, needle: &str) -> bool {
+fn parse_history_search_metadata(metadata: &[u8]) -> Option<HistorySearchMetadata> {
+    let metadata = String::from_utf8_lossy(metadata);
+    let metadata = metadata.trim_start_matches(['\r', '\n']);
+    if metadata.is_empty() {
+        return None;
+    }
+    let values: Vec<_> = metadata.split(FIELD_SEPARATOR).collect();
+    let hash = values.first()?.to_string();
+    let subject = values.get(5).unwrap_or(&"").to_string();
+    let message = values.get(7).unwrap_or(&"").trim().to_string();
+    let commit = CommitSummary {
+        short_hash: hash.chars().take(8).collect(),
+        hash,
+        parents: values
+            .get(1)
+            .unwrap_or(&"")
+            .split_whitespace()
+            .map(str::to_string)
+            .collect(),
+        author_name: values.get(2).unwrap_or(&"").to_string(),
+        author_email: values.get(3).unwrap_or(&"").to_string(),
+        date: values.get(4).unwrap_or(&"").to_string(),
+        body: message
+            .strip_prefix(&subject)
+            .unwrap_or(&message)
+            .trim_matches(['\r', '\n'])
+            .to_string(),
+        subject,
+        refs: values
+            .get(6)
+            .unwrap_or(&"")
+            .split(',')
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string)
+            .collect(),
+    };
+    Some(HistorySearchMetadata { commit, message })
+}
+
+fn history_metadata_matches(record: &HistorySearchMetadata, scope: &str, needle: &str) -> bool {
     let message_matches = || record.message.to_lowercase().contains(needle);
     let author_matches = || {
         format!(
@@ -1136,12 +1241,6 @@ fn history_record_matches(record: &HistorySearchRecord, scope: &str, needle: &st
         )
         .to_lowercase()
         .contains(needle)
-    };
-    let path_matches = || {
-        record
-            .paths
-            .iter()
-            .any(|path| path.to_lowercase().contains(needle))
     };
     let hash_matches = || record.commit.hash.to_lowercase().starts_with(needle);
     let refs_match = || {
@@ -1155,16 +1254,15 @@ fn history_record_matches(record: &HistorySearchRecord, scope: &str, needle: &st
     match scope {
         "message" => message_matches(),
         "author" => author_matches(),
-        "path" => path_matches(),
-        "hash" => hash_matches(),
-        _ => {
-            message_matches()
-                || author_matches()
-                || path_matches()
-                || hash_matches()
-                || refs_match()
-        }
+        _ => message_matches() || author_matches() || hash_matches() || refs_match(),
     }
+}
+
+fn history_path_matches(needle: &str, path: &[u8]) -> bool {
+    String::from_utf8_lossy(path)
+        .trim_matches(['\r', '\n'])
+        .to_lowercase()
+        .contains(needle)
 }
 
 fn append_date_filter(args: &mut Vec<String>, filter: &HistoryFilter) {
@@ -1389,8 +1487,8 @@ mod tests {
         )
     }
 
-    fn search_record() -> HistorySearchRecord {
-        HistorySearchRecord {
+    fn search_metadata() -> HistorySearchMetadata {
+        HistorySearchMetadata {
             commit: CommitSummary {
                 hash: "abcdef123456".into(),
                 short_hash: "abcdef12".into(),
@@ -1403,7 +1501,6 @@ mod tests {
                 refs: vec!["HEAD -> main".into()],
             },
             message: "Improve search\n\nInclude file paths".into(),
-            paths: vec!["src/renderer/App.tsx".into()],
         }
     }
 
@@ -1444,27 +1541,57 @@ mod tests {
 
     #[test]
     fn all_history_search_includes_paths_and_refs() {
-        let record = search_record();
-        assert!(history_record_matches(&record, "all", "app.tsx"));
-        assert!(history_record_matches(&record, "all", "main"));
+        let record = search_metadata();
+        assert!(history_metadata_matches(&record, "all", "main"));
+        assert!(history_path_matches("app.tsx", b"src/renderer/App.tsx"));
     }
 
     #[test]
     fn history_search_respects_selected_scope() {
-        let record = search_record();
-        assert!(history_record_matches(&record, "author", "ryan"));
-        assert!(!history_record_matches(&record, "message", "ryan"));
-        assert!(history_record_matches(&record, "hash", "abcdef"));
-        assert!(!history_record_matches(&record, "hash", "bcdef"));
+        let record = search_metadata();
+        assert!(history_metadata_matches(&record, "author", "ryan"));
+        assert!(!history_metadata_matches(&record, "message", "ryan"));
     }
 
     #[test]
-    fn parses_search_records_with_null_separated_paths() {
-        let output = "\u{001e}abcdef123456\u{001f}\u{001f}Ryan\u{001f}ryan@example.com\u{001f}2026-08-13T10:00:00+08:00\u{001f}Improve search\u{001f}HEAD -> main\u{001f}Improve search\n\0\nsrc/App.tsx\0";
-        let records = parse_history_search_records(output);
+    fn streams_search_records_when_metadata_and_paths_cross_chunks() {
+        let output = b"\x1eabcdef123456\x1f\x1fRyan\x1fryan@example.com\x1f2026-08-13T10:00:00+08:00\x1fImprove search\x1fHEAD -> main\x1fImprove search\n\0\nsrc/App.tsx\0";
+        let mut stream = HistorySearchStream::new("all", "app.tsx");
+        let mut records = Vec::new();
+        let mut on_record = |commit, matches| records.push((commit, matches));
+
+        stream.push(&output[..31], &mut on_record).unwrap();
+        stream
+            .push(&output[31..output.len() - 3], &mut on_record)
+            .unwrap();
+        stream
+            .push(&output[output.len() - 3..], &mut on_record)
+            .unwrap();
+        stream.finish(&mut on_record);
+
         assert_eq!(records.len(), 1);
-        assert_eq!(records[0].commit.short_hash, "abcdef12");
-        assert_eq!(records[0].paths, ["src/App.tsx"]);
+        assert_eq!(records[0].0.short_hash, "abcdef12");
+        assert!(records[0].1);
+    }
+
+    #[test]
+    fn streams_large_path_output_without_accumulating_it() {
+        let metadata = b"\x1eabcdef123456\x1f\x1fRyan\x1fryan@example.com\x1f2026-08-13T10:00:00+08:00\x1fImprove search\x1fHEAD -> main\x1fImprove search\n\0";
+        let mut stream = HistorySearchStream::new("all", "ryan");
+        let mut records = Vec::new();
+        let mut on_record = |commit, matches| records.push((commit, matches));
+        stream.push(metadata, &mut on_record).unwrap();
+
+        let path = vec![b'a'; 64 * 1024];
+        for _ in 0..(MAX_OUTPUT_BYTES / path.len() + 1) {
+            stream.push(&path, &mut on_record).unwrap();
+            assert!(stream.pending.is_empty());
+        }
+        stream.push(b"\0", &mut on_record).unwrap();
+        stream.finish(&mut on_record);
+
+        assert_eq!(records.len(), 1);
+        assert!(records[0].1);
     }
 
     #[test]

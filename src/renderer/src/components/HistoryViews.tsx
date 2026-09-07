@@ -3,16 +3,39 @@ import { useVirtualizer } from '@tanstack/react-virtual'
 import { ChevronDown, ChevronRight, LoaderCircle } from 'lucide-react'
 import type { CommitSummary, FileChange } from '../../../shared/types'
 
+function SearchMatch({ value, query }: { value: string; query: string }): React.JSX.Element {
+  const needle = query.trim().toLowerCase()
+  if (!needle) return <>{value}</>
+
+  const lowerValue = value.toLowerCase()
+  const parts: React.ReactNode[] = []
+  let start = 0
+  let matchIndex = lowerValue.indexOf(needle, start)
+  while (matchIndex !== -1) {
+    if (matchIndex > start) parts.push(value.slice(start, matchIndex))
+    parts.push(<mark className="search-match" key={`${matchIndex}-${parts.length}`}>{value.slice(matchIndex, matchIndex + needle.length)}</mark>)
+    start = matchIndex + needle.length
+    matchIndex = lowerValue.indexOf(needle, start)
+  }
+  if (start < value.length) parts.push(value.slice(start))
+
+  return <>{parts.length > 0 ? parts : value}</>
+}
+
 export function HistoryTable({
   commits,
   selectedHash,
   onSelect,
-  formatDate
+  formatDate,
+  searchQuery,
+  searchScope
 }: {
   commits: CommitSummary[]
   selectedHash: string | null
   onSelect: (hash: string) => void
   formatDate: (value: string) => string
+  searchQuery: string
+  searchScope: 'all' | 'message' | 'author'
 }): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null)
   const [expandedHashes, setExpandedHashes] = useState<Set<string>>(() => new Set())
@@ -44,6 +67,9 @@ export function HistoryTable({
               const selected = selectedHash === commit.hash
               const hasBody = commit.body.trim().length > 0
               const expanded = hasBody && expandedHashes.has(commit.hash)
+              const matchesAllFields = searchScope === 'all'
+              const authorQuery = matchesAllFields || searchScope === 'author' ? searchQuery : ''
+              const messageQuery = matchesAllFields || searchScope === 'message' ? searchQuery : ''
               return (
                 <div
                   key={commit.hash}
@@ -63,8 +89,8 @@ export function HistoryTable({
                   title="单击查看变更路径"
                 >
                   <span className="commit-graph" aria-hidden="true"><i /><b /></span>
-                  <span className="hash-cell"><code>{commit.shortHash}</code></span>
-                  <span className="author-cell">{commit.authorName}</span>
+                  <span className="hash-cell"><code><SearchMatch value={commit.shortHash} query={matchesAllFields ? searchQuery : ''} /></code></span>
+                  <span className="author-cell"><SearchMatch value={commit.authorName} query={authorQuery} /></span>
                   <span className="date-cell">{formatDate(commit.date)}</span>
                   <span className="message-cell">
                     {hasBody && (
@@ -90,10 +116,10 @@ export function HistoryTable({
                         {expanded ? <ChevronDown size={14} aria-hidden="true" /> : <ChevronRight size={14} aria-hidden="true" />}
                       </button>
                     )}
-                    <span className="message-heading"><strong>{commit.subject || '(无提交说明)'}</strong></span>
-                    {expanded && <span className="message-body">{commit.body}</span>}
+                    <span className="message-heading"><strong><SearchMatch value={commit.subject || '(无提交说明)'} query={messageQuery} /></strong></span>
+                    {expanded && <span className="message-body"><SearchMatch value={commit.body} query={messageQuery} /></span>}
                   </span>
-                  <span className="refs-cell" title={commit.refs.join('  ')}>{commit.refs.join('  ')}</span>
+                  <span className="refs-cell" title={commit.refs.join('  ')}><SearchMatch value={commit.refs.join('  ')} query={matchesAllFields ? searchQuery : ''} /></span>
                 </div>
               )
             })}
@@ -123,7 +149,8 @@ export function FileList({
   pageSize,
   onSelect,
   onCompare,
-  onRequestPage
+  onRequestPage,
+  searchQuery
 }: {
   pages: Map<number, FileChange[]>
   total: number
@@ -133,6 +160,7 @@ export function FileList({
   onSelect: (file: FileChange) => void
   onCompare: (file: FileChange) => void
   onRequestPage: (page: number) => void
+  searchQuery: string
 }): React.JSX.Element {
   const scrollRef = useRef<HTMLDivElement>(null)
   const virtualizer = useVirtualizer({
@@ -178,7 +206,7 @@ export function FileList({
                 onDoubleClick={() => onCompare(file)}
                 title={`${file.previousPath ? `${file.previousPath} → ${file.path}` : file.path}，双击在外部工具中对比`}
               >
-                <span className="file-path">{file.path}</span>
+                <span className="file-path"><SearchMatch value={file.path} query={searchQuery} /></span>
                 <span className={`file-action status-${file.status}`}>
                   <span className={`change-badge status-${file.status}`}>{file.status}</span>
                   {changeStatusLabels[file.status]}

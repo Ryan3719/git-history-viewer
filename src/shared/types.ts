@@ -1,4 +1,4 @@
-export type SearchScope = 'all' | 'message' | 'author' | 'path' | 'hash'
+export type SearchScope = 'all' | 'message' | 'author'
 export type RepositoryPathScopeKind = 'directory' | 'file'
 
 export interface HistoryFilter {

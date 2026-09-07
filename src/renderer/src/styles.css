@@ -185,6 +185,18 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .filter-search input::placeholder { color: var(--text-faint); }
 
+.search-scope { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 12px; white-space: nowrap; }
+
+.search-scope select {
+  height: 32px;
+  max-width: 112px;
+  padding: 0 24px 0 8px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  background: var(--surface);
+  color: var(--text);
+}
+
 .date-filter input {
   height: 32px;
   border: 1px solid var(--border-strong);
@@ -311,6 +323,14 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 .log-row.is-selected .commit-graph b { border-color: var(--focus-soft); }
 
 .hash-cell code { color: var(--accent); font-weight: 650; }
+
+.search-match {
+  padding: 0;
+  background: transparent;
+  color: var(--removed);
+  font: inherit;
+  font-weight: 700;
+}
 
 .author-cell, .date-cell, .refs-cell { overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
 
@@ -633,6 +653,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   .toolbar-center { display: none; }
   .filter-bar { gap: 6px; padding-inline: 10px; }
   .filter-search { min-width: 170px; }
+  .search-scope > span { font-size: 0; }
   .date-filter label { font-size: 0; }
   .date-filter input { width: 118px; }
   .history-toolbar-actions { gap: 5px; }

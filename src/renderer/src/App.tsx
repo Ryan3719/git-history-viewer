@@ -8,6 +8,7 @@ import {
   FolderOpen,
   GitBranch,
   Info,
+  List,
   LoaderCircle,
   Moon,
   Network,
@@ -28,7 +29,6 @@ import {
 } from './components/AppDialogs'
 import {
   fileChangesPageSize,
-  initialHistoryFilter,
   useRepositoryHistory
 } from './hooks/useRepositoryHistory'
 import { useSshMappings } from './hooks/useSshMappings'
@@ -39,7 +39,6 @@ import type {
   RecentRepository,
   RepositoryInfo,
   RepositoryOpenRequest,
-  SearchScope,
 } from '../../shared/types'
 
 type Theme = 'light' | 'dark'
@@ -54,14 +53,6 @@ type PathsResizeState = {
 const minimumPathsPanelHeight = 160
 const minimumHistoryHeight = 230
 const applicationChromeHeight = 104
-
-const searchScopes: Array<{ value: SearchScope; label: string }> = [
-  { value: 'all', label: '全部字段' },
-  { value: 'message', label: '提交信息' },
-  { value: 'author', label: '作者' },
-  { value: 'path', label: '文件路径' },
-  { value: 'hash', label: 'Hash' }
-]
 
 function repositoryDisplayPath(repository: RepositoryInfo): string {
   const rootPath = repository.displayPath ?? repository.path
@@ -145,6 +136,9 @@ function App(): React.JSX.Element {
     historyHasMore,
     loadingDetails,
     loadHistory,
+    loadAllHistory,
+    loadingAllHistory,
+    resetFilter,
     requestFileChangesPage,
     reset: resetRepositoryHistory
   } = useRepositoryHistory(repository, setError)
@@ -351,7 +345,7 @@ function App(): React.JSX.Element {
     }
   }
 
-  const clearFilter = (): void => setFilter(initialHistoryFilter)
+  const clearFilter = (): void => resetFilter()
 
   const openSettings = async (): Promise<void> => {
     setExternalSettings(await window.gitHistory.getExternalDiffSettings())
@@ -605,19 +599,23 @@ function App(): React.JSX.Element {
       <section className="filter-bar" aria-label="提交筛选">
         <div className="filter-search">
           <Search size={17} aria-hidden="true" />
-          <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="筛选提交信息、路径、作者、Hash" aria-label="搜索提交" />
+          <input value={filter.query} onChange={(event) => setFilter({ ...filter, query: event.target.value })} placeholder="搜索提交、作者、文件路径或哈希" aria-label="搜索提交、作者、文件路径或哈希" />
         </div>
-        <select value={filter.scope} onChange={(event) => setFilter({ ...filter, scope: event.target.value as SearchScope })} aria-label="筛选字段">
-          {searchScopes.map((scope) => <option key={scope.value} value={scope.value}>{scope.label}</option>)}
-        </select>
-        <span className="date-filter"><CalendarDays size={15} /><label>From<input type="date" value={filter.from} onChange={(event) => setFilter({ ...filter, from: event.target.value })} /></label><label>To<input type="date" value={filter.to} onChange={(event) => setFilter({ ...filter, to: event.target.value })} /></label></span>
-        {activeFilterCount > 0 && <button className="quiet-button" type="button" onClick={clearFilter}><X size={15} />清除</button>}
-        <span className="result-summary">{loadingHistory ? <LoaderCircle className="spin" size={15} /> : null}显示 {commits.length.toLocaleString()} 条</span>
-        {historyHasMore && (
-          <button className="quiet-button compact" type="button" onClick={() => void loadHistory(true)} disabled={loadingHistory}>
-            继续加载
-          </button>
-        )}
+        <span className="date-filter"><CalendarDays size={15} aria-hidden="true" /><label>起始<input type="date" value={filter.from} onChange={(event) => setFilter({ ...filter, from: event.target.value })} /></label><label>截止<input type="date" value={filter.to} onChange={(event) => setFilter({ ...filter, to: event.target.value })} /></label></span>
+        <div className="history-toolbar-actions">
+          {activeFilterCount > 0 && <button className="quiet-button compact" type="button" onClick={clearFilter}><X size={15} aria-hidden="true" />清除筛选</button>}
+          <span className="result-summary" aria-live="polite">{loadingHistory || loadingAllHistory ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : null}已加载 {commits.length.toLocaleString()} 条</span>
+          {historyHasMore && (
+            <span className="history-load-actions" role="group" aria-label="历史记录加载操作">
+              <button className="quiet-button compact" type="button" onClick={() => void loadHistory(true)} disabled={loadingHistory || loadingAllHistory}>
+                <ChevronDown size={15} aria-hidden="true" />继续加载
+              </button>
+              <button className="quiet-button compact" type="button" onClick={() => void loadAllHistory()} disabled={loadingHistory || loadingAllHistory} title="按每批 100 条加载全部历史">
+                {loadingAllHistory ? <LoaderCircle className="spin" size={15} aria-hidden="true" /> : <List size={15} aria-hidden="true" />}加载全部
+              </button>
+            </span>
+          )}
+        </div>
       </section>
 
       {error && <div className="toast-error" role="alert"><span>{error}</span><button className="icon-button" type="button" aria-label="关闭错误提示" title="关闭" onClick={() => setError('')}><X size={16} /></button></div>}

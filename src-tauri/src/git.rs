@@ -33,6 +33,7 @@ const FILE_CHANGES_PAGE_SIZE: usize = 200;
 const INITIAL_FILE_CHANGES_AVAILABLE: usize = 50;
 const MAX_RENAME_CANDIDATES: usize = 2_000;
 const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
+const HISTORY_COMMIT_BODY_LIMIT: usize = 8 * 1024;
 const HISTORY_SEARCH_BATCH_SIZE: usize = 100;
 const MAX_MEMORY_FILE_CHANGES: usize = 32;
 const MAX_PERSISTED_FILE_CHANGES: usize = 256;
@@ -42,8 +43,10 @@ const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const GIT_CLONE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SSH_HOME_MARKER: &str = "__git_history_viewer_home__";
 const FILE_CHANGES_CACHE_VERSION: u32 = 3;
-const COMMIT_FORMAT: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%b%x1f%D";
-const SEARCH_COMMIT_FORMAT: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1f%B";
+// A single unbounded commit body must not prevent its file history from loading.
+const COMMIT_FORMAT_PREFIX: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f";
+const COMMIT_FORMAT_SUFFIX: &str = "%x1f%D";
+const SEARCH_COMMIT_FORMAT_PREFIX: &str = "%x1e%H%x1f%P%x1f%an%x1f%ae%x1f%aI%x1f%s%x1f%D%x1f";
 
 #[derive(Clone)]
 struct SshLocation {
@@ -246,7 +249,7 @@ impl GitService {
             "log".into(),
             "--date=iso-strict".into(),
             format!("--max-count={}", page_limit + 1),
-            format!("--format={COMMIT_FORMAT}"),
+            format!("--format={}", commit_format()),
         ];
         append_date_filter(&mut args, filter);
         if offset > 0 {
@@ -298,7 +301,7 @@ impl GitService {
                 "-z".into(),
                 format!("--max-count={HISTORY_SEARCH_BATCH_SIZE}"),
                 format!("--skip={scan_offset}"),
-                format!("--format={SEARCH_COMMIT_FORMAT}"),
+                format!("--format={}", search_commit_format()),
             ];
             append_date_filter(&mut args, filter);
             if !path_scope.is_empty() {
@@ -803,7 +806,7 @@ impl GitService {
         let mut output = Vec::new();
         self.run_git_stream_with_timeout(cwd, args, timeout, cancelled, |chunk| {
             if output.len().saturating_add(chunk.len()) > maximum_output {
-                return Err("Git 输出过大，已停止读取。请缩小筛选范围或改用外部对比工具。".into());
+                return Err("Git 输出超过安全上限，已停止读取。".into());
             }
             output.extend_from_slice(chunk);
             Ok(())
@@ -1048,11 +1051,7 @@ fn parse_commit_records(output: &str) -> Vec<CommitSummary> {
                 author_email: values.get(3).unwrap_or(&"").to_string(),
                 date: values.get(4).unwrap_or(&"").to_string(),
                 subject: values.get(5).unwrap_or(&"").to_string(),
-                body: values
-                    .get(6)
-                    .unwrap_or(&"")
-                    .trim_matches(['\r', '\n'])
-                    .to_string(),
+                body: values.get(6).unwrap_or(&"").trim().to_string(),
                 refs: values
                     .get(7)
                     .unwrap_or(&"")
@@ -1064,6 +1063,14 @@ fn parse_commit_records(output: &str) -> Vec<CommitSummary> {
             })
         })
         .collect()
+}
+
+fn commit_format() -> String {
+    format!("{COMMIT_FORMAT_PREFIX}%<({HISTORY_COMMIT_BODY_LIMIT},trunc)%b{COMMIT_FORMAT_SUFFIX}")
+}
+
+fn search_commit_format() -> String {
+    format!("{SEARCH_COMMIT_FORMAT_PREFIX}%<({HISTORY_COMMIT_BODY_LIMIT},trunc)%B")
 }
 
 fn parse_history_search_records(output: &str) -> Vec<HistorySearchRecord> {
@@ -1577,5 +1584,74 @@ mod tests {
             .unwrap();
         assert!(search.commits.is_empty());
         assert!(!search.has_more);
+    }
+
+    #[test]
+    fn lists_file_history_when_a_commit_body_exceeds_the_output_limit() {
+        let repository = tempfile::tempdir().unwrap();
+        let cache = tempfile::tempdir().unwrap();
+        let path = repository.path();
+        let run = |args: &[&str]| {
+            let status = Command::new("git")
+                .args(args)
+                .current_dir(path)
+                .status()
+                .unwrap();
+            assert!(status.success());
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.name", "History Test"]);
+        run(&["config", "user.email", "history@example.com"]);
+        fs::write(path.join("tracked.txt"), "content").unwrap();
+        let message_path = path.join("message.txt");
+        let mut message = File::create(&message_path).unwrap();
+        message.write_all(b"Large history message\n\n").unwrap();
+        message.write_all(&vec![b'x'; MAX_OUTPUT_BYTES]).unwrap();
+        drop(message);
+        run(&["add", "tracked.txt"]);
+        run(&["commit", "-q", "-F", "message.txt"]);
+
+        let service = git_service(cache.path());
+        let filter = HistoryFilter {
+            query: String::new(),
+            scope: "all".into(),
+            from: String::new(),
+            to: String::new(),
+            limit: 1,
+        };
+        let generation = service.next_history_request();
+        let result = service
+            .list_commits(
+                path.to_string_lossy().as_ref(),
+                Some("tracked.txt"),
+                Some("file"),
+                &filter,
+                0,
+                generation,
+            )
+            .unwrap();
+
+        assert_eq!(result.commits.len(), 1);
+        assert_eq!(result.commits[0].subject, "Large history message");
+        assert!(result.commits[0].body.len() <= HISTORY_COMMIT_BODY_LIMIT);
+
+        let search_filter = HistoryFilter {
+            query: "Large history message".into(),
+            scope: "all".into(),
+            ..filter
+        };
+        let search = service
+            .list_commits(
+                path.to_string_lossy().as_ref(),
+                Some("tracked.txt"),
+                Some("file"),
+                &search_filter,
+                0,
+                service.next_history_request(),
+            )
+            .unwrap();
+        assert_eq!(search.commits.len(), 1);
+        assert_eq!(search.commits[0].subject, "Large history message");
+        assert!(search.commits[0].body.len() <= HISTORY_COMMIT_BODY_LIMIT);
     }
 }

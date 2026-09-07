@@ -185,7 +185,7 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
 
 .filter-search input::placeholder { color: var(--text-faint); }
 
-.filter-bar select, .date-filter input {
+.date-filter input {
   height: 32px;
   border: 1px solid var(--border-strong);
   border-radius: 4px;
@@ -193,15 +193,23 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   color: var(--text);
 }
 
-.filter-bar select { width: 94px; padding: 0 5px; }
+.date-filter { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
 
-.date-filter { display: flex; align-items: center; gap: 5px; white-space: nowrap; }
+.date-filter label { display: inline-flex; align-items: center; gap: 5px; color: var(--text-muted); font-size: 12px; }
 
-.date-filter label { display: inline-flex; align-items: center; gap: 4px; color: var(--text-muted); font-size: 12px; }
+.date-filter input { width: 126px; padding: 0 7px; font-variant-numeric: tabular-nums; }
 
-.date-filter input { width: 128px; padding: 0 5px; }
+.history-toolbar-actions { display: inline-flex; min-width: 0; align-items: center; gap: 8px; margin-left: auto; }
 
-.result-summary { display: inline-flex; align-items: center; min-width: 82px; justify-content: flex-end; gap: 5px; color: var(--text-faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+.result-summary { display: inline-flex; align-items: center; min-width: 96px; justify-content: flex-end; gap: 5px; color: var(--text-faint); white-space: nowrap; font-variant-numeric: tabular-nums; }
+
+.history-load-actions { display: inline-flex; align-items: stretch; overflow: hidden; border: 1px solid var(--border); border-radius: 4px; background: var(--surface); }
+
+.history-load-actions .quiet-button { min-height: 30px; border-radius: 0; }
+
+.history-load-actions .quiet-button + .quiet-button { border-left: 1px solid var(--border); }
+
+.history-load-actions .quiet-button:hover { background: var(--surface-hover); }
 
 .quiet-button, .secondary-button, .primary-button, .danger-button {
   display: inline-flex;
@@ -626,6 +634,9 @@ code { font-family: "Cascadia Mono", Consolas, monospace; font-size: 0.94em; }
   .filter-bar { gap: 6px; padding-inline: 10px; }
   .filter-search { min-width: 170px; }
   .date-filter label { font-size: 0; }
+  .date-filter input { width: 118px; }
+  .history-toolbar-actions { gap: 5px; }
+  .result-summary { min-width: 88px; }
 }
 
 @media (max-width: 720px) {

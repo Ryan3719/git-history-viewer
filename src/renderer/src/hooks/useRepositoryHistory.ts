@@ -5,10 +5,11 @@ import type {
   FileChange,
   FileChangesStatus,
   HistoryFilter,
+  HistoryPage,
   RepositoryInfo
 } from '../../../shared/types'
 
-export const historyPageSize = 200
+export const historyPageSize = 100
 export const fileChangesPageSize = 200
 const maxCachedFileChangePages = 5
 
@@ -45,16 +46,21 @@ export function useRepositoryHistory(
   loadingHistory: boolean
   historyHasMore: boolean
   loadingDetails: boolean
-  loadHistory: (append?: boolean) => Promise<void>
+  loadHistory: (append?: boolean) => Promise<HistoryPage | null>
+  loadAllHistory: () => Promise<void>
+  loadingAllHistory: boolean
+  resetFilter: () => void
   requestFileChangesPage: (page: number) => void
   reset: () => void
 } {
   const historyRequestRef = useRef(0)
   const historyOffsetRef = useRef(0)
   const commitsRef = useRef<CommitSummary[]>([])
+  const autoDateRangeRef = useRef(true)
+  const suppressDateRangeReloadRef = useRef(false)
   const filePageRequestsRef = useRef(new Set<string>())
   const filePageGenerationRef = useRef(0)
-  const [filter, setFilter] = useState<HistoryFilter>(initialHistoryFilter)
+  const [filter, setFilterState] = useState<HistoryFilter>(initialHistoryFilter)
   const [commits, setCommits] = useState<CommitSummary[]>([])
   const [selectedHash, setSelectedHash] = useState<string | null>(null)
   const [details, setDetails] = useState<CommitDetails | null>(null)
@@ -62,6 +68,7 @@ export function useRepositoryHistory(
   const [filePages, setFilePages] = useState<Map<number, FileChange[]>>(() => new Map())
   const [selectedFile, setSelectedFile] = useState<FileChange | null>(null)
   const [loadingHistory, setLoadingHistory] = useState(false)
+  const [loadingAllHistory, setLoadingAllHistory] = useState(false)
   const [historyHasMore, setHistoryHasMore] = useState(false)
   const [loadingDetails, setLoadingDetails] = useState(false)
 
@@ -72,10 +79,12 @@ export function useRepositoryHistory(
   const reset = useCallback((): void => {
     historyRequestRef.current += 1
     historyOffsetRef.current = 0
+    autoDateRangeRef.current = true
+    suppressDateRangeReloadRef.current = false
     filePageGenerationRef.current += 1
     filePageRequestsRef.current.clear()
     commitsRef.current = []
-    setFilter(initialHistoryFilter)
+    setFilterState(initialHistoryFilter)
     setCommits([])
     setHistoryHasMore(false)
     setSelectedHash(null)
@@ -84,14 +93,49 @@ export function useRepositoryHistory(
     setFilePages(new Map())
     setSelectedFile(null)
     setLoadingHistory(false)
+    setLoadingAllHistory(false)
     setLoadingDetails(false)
   }, [])
 
+  const setFilter = useCallback<React.Dispatch<React.SetStateAction<HistoryFilter>>>((next) => {
+    autoDateRangeRef.current = false
+    historyRequestRef.current += 1
+    setFilterState(next)
+  }, [])
+
+  const resetFilter = useCallback((): void => {
+    autoDateRangeRef.current = true
+    suppressDateRangeReloadRef.current = false
+    historyRequestRef.current += 1
+    setFilterState(initialHistoryFilter)
+  }, [])
+
+  const dateFromCommit = (commit: CommitSummary): string => commit.date.match(/^\d{4}-\d{2}-\d{2}/)?.[0] ?? ''
+
+  const updateAutomaticDateRange = useCallback((page: HistoryPage, append: boolean): void => {
+    if (!autoDateRangeRef.current || page.commits.length === 0) return
+    const dates = page.commits.map(dateFromCommit).filter(Boolean)
+    if (dates.length === 0) return
+    const pageFrom = dates.reduce((earliest, date) => date < earliest ? date : earliest, dates[0])
+    const pageTo = dates.reduce((latest, date) => date > latest ? date : latest, dates[0])
+    setFilterState((current) => {
+      if (!autoDateRangeRef.current) return current
+      const from = append && current.from ? (pageFrom < current.from ? pageFrom : current.from) : pageFrom
+      const to = append && current.to ? (pageTo > current.to ? pageTo : current.to) : pageTo
+      if (from === current.from && to === current.to) return current
+      suppressDateRangeReloadRef.current = true
+      return { ...current, from, to }
+    })
+  }, [])
+
   const loadHistory = useCallback(async (append = false) => {
-    if (!repository) return
+    if (!repository) return null
     const requestId = ++historyRequestRef.current
     const previous = append ? commitsRef.current : []
     const offset = append ? historyOffsetRef.current : 0
+    const requestFilter = autoDateRangeRef.current
+      ? { ...filter, from: '', to: append ? filter.to : '' }
+      : filter
     setLoadingHistory(true)
     onError('')
     try {
@@ -99,10 +143,10 @@ export function useRepositoryHistory(
         repository.path,
         repository.pathScope,
         repository.pathScopeKind,
-        filter,
+        requestFilter,
         offset
       )
-      if (requestId !== historyRequestRef.current) return
+      if (requestId !== historyRequestRef.current) return null
       const knownHashes = new Set(previous.map((commit) => commit.hash))
       const combined = append
         ? [...previous, ...result.commits.filter((commit) => !knownHashes.has(commit.hash))]
@@ -111,13 +155,15 @@ export function useRepositoryHistory(
       setCommits(combined)
       historyOffsetRef.current = result.nextOffset
       setHistoryHasMore(result.hasMore)
+      updateAutomaticDateRange(result, append)
       setSelectedHash((current) => (
         current && combined.some((item) => item.hash === current)
           ? current
           : (combined[0]?.hash ?? null)
       ))
+      return result
     } catch (error) {
-      if (requestId !== historyRequestRef.current || isAbortError(error)) return
+      if (requestId !== historyRequestRef.current || isAbortError(error)) return null
       onError(error instanceof Error ? error.message : '无法读取提交历史。')
       if (!append) {
         commitsRef.current = []
@@ -126,13 +172,33 @@ export function useRepositoryHistory(
         historyOffsetRef.current = 0
       }
       setHistoryHasMore(false)
+      return null
     } finally {
       if (requestId === historyRequestRef.current) setLoadingHistory(false)
     }
-  }, [filter, onError, repository])
+  }, [filter, onError, repository, updateAutomaticDateRange])
+
+  const loadAllHistory = useCallback(async (): Promise<void> => {
+    if (!repository || loadingHistory || loadingAllHistory) return
+    setLoadingAllHistory(true)
+    try {
+      let append = commitsRef.current.length > 0
+      while (true) {
+        const result = await loadHistory(append)
+        if (!result || !result.hasMore) break
+        append = true
+      }
+    } finally {
+      setLoadingAllHistory(false)
+    }
+  }, [loadHistory, loadingAllHistory, loadingHistory, repository])
 
   useEffect(() => {
     if (!repository) return
+    if (suppressDateRangeReloadRef.current) {
+      suppressDateRangeReloadRef.current = false
+      return
+    }
     const timer = window.setTimeout(() => void loadHistory(false), filter.query ? 320 : 0)
     return () => window.clearTimeout(timer)
   }, [filter, loadHistory, repository])
@@ -262,6 +328,9 @@ export function useRepositoryHistory(
     historyHasMore,
     loadingDetails,
     loadHistory,
+    loadAllHistory,
+    loadingAllHistory,
+    resetFilter,
     requestFileChangesPage,
     reset
   }
